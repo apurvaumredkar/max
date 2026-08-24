@@ -10,8 +10,11 @@ import json
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 from utils.discord_functions import send_discord_message
+from utils.logging_config import get_logger
 
 load_dotenv("secrets/.env")
+
+log = get_logger(__name__)
 
 JOB_TRIGGER_URL = "http://localhost/max/job-trigger"
 
@@ -33,7 +36,7 @@ def _load_persona():
         with open("context/SYSTEM.md", "r", encoding="utf-8") as system_file:
             return system_file.read()
     except Exception as e:
-        print(f"Error loading persona file: {e}")
+        log.error("Failed to load persona from context/SYSTEM.md: %s", e)
 
 
 def _load_history():
@@ -45,14 +48,14 @@ def _load_history():
             fd = os.open(filename, flags)
             os.close(fd)
         except Exception as e:
-            print(f"Error creating {filename}: {e}")
+            log.error("Failed to create chat log %s: %s", filename, e)
     else:
         try:
             with open(filename, "r") as chats:
                 turns = [json.loads(i) for i in chats.readlines()]
                 return [turn for turn in turns if turn.get("source") != "job"]
         except Exception as e:
-            print(f"Error opening file: {e}")
+            log.error("Failed to read today's history %s: %s", filename, e)
     return []
 
 
@@ -67,7 +70,7 @@ def _load_all_history(exclude_files=()):
             with open(f"chats/{filename}", "r") as chats:
                 turns.extend(json.loads(line) for line in chats.readlines())
         except Exception as e:
-            print(f"Error opening file: {e}")
+            log.error("Failed to read history file chats/%s: %s", filename, e)
     return turns
 
 
@@ -124,7 +127,7 @@ def _save_turn(turn: dict):
         with open(filename, "a") as chats:
             chats.write(json.dumps(turn) + "\n")
     except Exception as e:
-        print(f"Error writing to file: {e}")
+        log.error("Failed to append turn to %s: %s", filename, e)
     return turn
 
 
@@ -135,7 +138,12 @@ def _execute_bash(command: str):
     Args:
         command: The bash command to execute.
     """
+    log.info("Executing bash: %s", command)
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.warning(
+            "Bash exited %s: %s", result.returncode, (result.stderr or "").strip()[:300]
+        )
     return {
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -151,7 +159,7 @@ def _load_jobs():
         with open(filename, "r") as jobs_file:
             return json.load(jobs_file)
     except Exception as e:
-        print(f"Error loading jobs file: {e}")
+        log.error("Failed to load jobs file %s: %s", filename, e)
         return {"scheduled": [], "cron": []}
 
 
@@ -161,13 +169,19 @@ def _save_jobs(jobs: dict):
         with open(filename, "w") as jobs_file:
             json.dump(jobs, jobs_file, indent=2)
     except Exception as e:
-        print(f"Error writing jobs file: {e}")
+        log.error("Failed to write jobs file %s: %s", filename, e)
 
 
 def _install_crontab_line(line: str):
     existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
     updated = existing + line + "\n"
-    subprocess.run(["crontab", "-"], input=updated, capture_output=True, text=True)
+    result = subprocess.run(
+        ["crontab", "-"], input=updated, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        log.error("Failed to install crontab line %r: %s", line, result.stderr.strip())
+    else:
+        log.info("Installed crontab line: %s", line)
 
 
 SYSTEM_TRIGGER_PREFIX = "[THIS IS AN AUTOMATED SYSTEM TRIGGER]"
@@ -207,6 +221,7 @@ def _cron(name: str, schedule: str, prompt: str, channel: str = "reminders"):
         {"name": name, "schedule": schedule, "prompt": prompt, "channel": channel}
     )
     _save_jobs(jobs)
+    log.info("Cron job created: %r schedule=%r channel=%s", name, schedule, channel)
     return {"status": "created", "name": name, "schedule": schedule, "prompt": prompt}
 
 
@@ -232,6 +247,7 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
         {"name": name, "run_at": run_at, "prompt": prompt, "channel": channel}
     )
     _save_jobs(jobs)
+    log.info("Scheduled job created: %r run_at=%s channel=%s", name, run_at, channel)
     return {"status": "created", "name": name, "run_at": run_at, "prompt": prompt}
 
 
@@ -292,6 +308,7 @@ TOOL_SCHEMAS = [
 
 
 async def _generate_reply(user_input: str, save_user_turn: bool = True):
+    log.info("Generating reply (non-streaming, save_user_turn=%s)", save_user_turn)
     persona = _load_persona()
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
@@ -342,7 +359,12 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
         for tool_call in message.tool_calls:
             function_to_call = AVAILABLE_TOOLS[tool_call.function.name]
             arguments = json.loads(tool_call.function.arguments)
-            output = function_to_call(**arguments)
+            log.info("Tool call: %s(%s)", tool_call.function.name, arguments)
+            try:
+                output = function_to_call(**arguments)
+            except Exception as e:
+                log.exception("Tool %s failed", tool_call.function.name)
+                output = {"error": f"{type(e).__name__}: {e}"}
             tool_calls_log.append(
                 {
                     "name": tool_call.function.name,
@@ -370,6 +392,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
 
 
 async def _generate_reply_stream(user_input: str):
+    log.info("Chat request: %d chars", len(user_input))
     persona = _load_persona()
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -450,7 +473,12 @@ async def _generate_reply_stream(user_input: str):
         for tc in tool_calls:
             function_to_call = AVAILABLE_TOOLS[tc["name"]]
             arguments = json.loads(tc["arguments"])
-            output = function_to_call(**arguments)
+            log.info("Tool call: %s(%s)", tc["name"], arguments)
+            try:
+                output = function_to_call(**arguments)
+            except Exception as e:
+                log.exception("Tool %s failed", tc["name"])
+                output = {"error": f"{type(e).__name__}: {e}"}
             tool_call_record = {
                 "name": tc["name"],
                 "arguments": arguments,
@@ -486,6 +514,13 @@ async def chat(user_input: str = Body(embed=True)):
 
 @router.post("/job-trigger")
 async def job_trigger(prompt: str = Body(embed=True), channel: str = Body(embed=True)):
+    log.info("Job fired → channel=%s prompt=%r", channel, prompt[:120])
     turn = await _generate_reply(prompt, save_user_turn=False)
-    send_discord_message(channel, turn["content"])
+    result = send_discord_message(channel, turn["content"])
+    if result.get("ok"):
+        log.info("Job message posted to Discord #%s", channel)
+    else:
+        log.error(
+            "Discord post to #%s failed (status=%s)", channel, result.get("status_code")
+        )
     return turn

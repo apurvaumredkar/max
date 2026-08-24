@@ -17,7 +17,11 @@ import os
 import requests
 from dotenv import load_dotenv
 
+from utils.logging_config import get_logger
+
 load_dotenv("secrets/.env")
+
+log = get_logger(__name__)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 FILES_URL = "https://www.googleapis.com/drive/v3/files"
@@ -40,6 +44,7 @@ def _get_access_token():
 
 
 def list_files(folder_id=None):
+    log.info("Listing Drive files (folder_id=%s)", folder_id or "root")
     params = {
         "fields": f"files({FIELDS})",
         "pageSize": 100,
@@ -61,6 +66,7 @@ def list_files(folder_id=None):
 
 
 def get_file_info(file_id):
+    log.info("Fetching Drive metadata for %s", file_id)
     response = requests.get(
         f"{FILES_URL}/{file_id}",
         headers={"Authorization": f"Bearer {_get_access_token()}"},

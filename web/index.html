@@ -22,15 +22,34 @@
 </pre>
 
 <div class="container">
-    <div class="messages"></div>
-    <div class="chat-input-bar">
-        <input type="text">
-        <button class="send-button" aria-label="Send">
-            <svg viewBox="0 0 24 24">
-                <line x1="12" y1="19" x2="12" y2="5"></line>
-                <polyline points="5 12 12 5 19 12"></polyline>
-            </svg>
-        </button>
+    <div class="tab-bar" role="tablist">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="chat">Chat</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="logs">Logs</button>
+    </div>
+
+    <div class="tab-panel" data-panel="logs" hidden>
+        <div class="logs-toolbar">
+            <span class="logs-status">connecting…</span>
+            <label class="logs-follow">
+                <input type="checkbox" class="logs-follow-toggle" checked>
+                Follow
+            </label>
+            <button class="logs-clear">Clear</button>
+        </div>
+        <div class="logs-output"></div>
+    </div>
+
+    <div class="tab-panel active" data-panel="chat">
+        <div class="messages"></div>
+        <div class="chat-input-bar">
+            <input type="text">
+            <button class="send-button" aria-label="Send">
+                <svg viewBox="0 0 24 24">
+                    <line x1="12" y1="19" x2="12" y2="5"></line>
+                    <polyline points="5 12 12 5 19 12"></polyline>
+                </svg>
+            </button>
+        </div>
     </div>
 </div>
 

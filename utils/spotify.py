@@ -26,7 +26,11 @@ from dotenv import load_dotenv, set_key
 from fastapi import APIRouter, Body
 from fastapi.responses import RedirectResponse
 
+from utils.logging_config import get_logger
+
 load_dotenv("secrets/.env")
+
+log = get_logger(__name__)
 
 router = APIRouter()
 
@@ -133,24 +137,36 @@ def transfer_playback(device_id):
         devices = list_devices()
     except Exception as e:
         # Can't tell who's active — err on the side of not stealing playback.
-        print(f"Error listing Spotify devices: {e}")
+        log.error("Failed to list Spotify devices: %s", e)
         return {"status": "skipped", "reason": "device-list-failed"}
 
     active = next((d for d in devices if d.get("is_active")), None)
     if active and active.get("id") != device_id:
+        log.info(
+            "Transfer skipped: %r is active, leaving playback there",
+            active.get("name"),
+        )
         return {
             "status": "skipped",
             "reason": "another-device-active",
             "active_device": active.get("name"),
         }
     if active and active.get("id") == device_id:
+        log.info("Transfer skipped: web player is already the active device")
         return {"status": "already-active", "active_device": active.get("name")}
 
+    log.info("No active device — claiming playback for the web player")
     response = requests.put(
         PLAYER_URL,
         headers=_auth_headers(),
         json={"device_ids": [device_id], "play": False},
     )
+    if response.status_code >= 400:
+        log.error(
+            "Playback transfer failed (%s): %s",
+            response.status_code,
+            response.text[:200],
+        )
     return {"status": "transferred", "status_code": response.status_code}
 
 
@@ -262,7 +278,7 @@ async def route_now_playing():
     try:
         return now_playing()
     except Exception as e:
-        print(f"Error fetching Spotify now-playing: {e}")
+        log.error("Failed to fetch Spotify now-playing: %s", e)
         return {"is_playing": False, "track": None}
 
 
