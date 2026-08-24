@@ -1,0 +1,9 @@
+.claude
+.venv
+chats/
+context/
+secrets/
+CLAUDE.md
+__pycache__/
+*.pyc
+web/assets/

@@ -1,0 +1,429 @@
+html {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+}
+
+body {
+    background-color: #000000;
+    color: #ffffff;
+    margin: 0;
+    padding: 20px;
+    box-sizing: border-box;
+    height: 100%;
+    overflow: hidden;
+    font-size: 17px;
+    font-family: 'Open Sans', sans-serif;
+}
+
+.container,
+.jobs-container,
+.messages,
+.scheduled-jobs,
+.cron-jobs {
+    scrollbar-width: thin;
+    scrollbar-color: #404040 transparent;
+}
+
+.container::-webkit-scrollbar,
+.jobs-container::-webkit-scrollbar,
+.messages::-webkit-scrollbar,
+.scheduled-jobs::-webkit-scrollbar,
+.cron-jobs::-webkit-scrollbar {
+    width: 8px;
+}
+
+.container::-webkit-scrollbar-track,
+.jobs-container::-webkit-scrollbar-track,
+.messages::-webkit-scrollbar-track,
+.scheduled-jobs::-webkit-scrollbar-track,
+.cron-jobs::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.container::-webkit-scrollbar-thumb,
+.jobs-container::-webkit-scrollbar-thumb,
+.messages::-webkit-scrollbar-thumb,
+.scheduled-jobs::-webkit-scrollbar-thumb,
+.cron-jobs::-webkit-scrollbar-thumb {
+    background-color: #404040;
+    border-radius: 4px;
+}
+
+.container::-webkit-scrollbar-thumb:hover,
+.jobs-container::-webkit-scrollbar-thumb:hover,
+.messages::-webkit-scrollbar-thumb:hover,
+.scheduled-jobs::-webkit-scrollbar-thumb:hover,
+.cron-jobs::-webkit-scrollbar-thumb:hover {
+    background-color: #555555;
+}
+
+pre {
+    margin: 0 0 20px 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.container {
+    width: 40%;
+    height: calc(100vh - 180px);
+    border-radius: 50px;
+    background-color: #1a1a1a;
+    padding: 20px;
+    box-sizing: border-box;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    width: 294px;
+    max-height: calc(100vh - 40px);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.jobs-container {
+    flex: 1;
+    min-height: 0;
+    border-radius: 24px;
+    background-color: #1a1a1a;
+    padding: 24px;
+    box-sizing: border-box;
+    overflow-y: hidden;
+}
+
+.spotify-container {
+    flex-shrink: 0;
+    border-radius: 24px;
+    background-color: #1a1a1a;
+    padding: 20px;
+    box-sizing: border-box;
+}
+
+.spotify-menu-button {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    background: none;
+    border: none;
+    color: #888888;
+    cursor: pointer;
+    padding: 4px;
+    display: flex;
+}
+
+.spotify-menu-button:hover {
+    color: #ffffff;
+}
+
+.spotify-menu-button svg {
+    width: 18px;
+    height: 18px;
+    fill: currentColor;
+}
+
+.spotify-menu {
+    display: none;
+    position: absolute;
+    bottom: 38px;
+    right: 10px;
+    background-color: #2a2a2a;
+    border-radius: 10px;
+    padding: 6px;
+    z-index: 1;
+    min-width: 130px;
+}
+
+.spotify-menu.open {
+    display: block;
+}
+
+.spotify-menu a {
+    display: block;
+    color: #ffffff;
+    text-decoration: none;
+    font-size: 14px;
+    padding: 8px 10px;
+    border-radius: 6px;
+}
+
+.spotify-menu a:hover {
+    background-color: #383838;
+}
+
+.spotify-container .album-art {
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 12px;
+    object-fit: cover;
+    background-color: #2a2a2a;
+    display: block;
+    margin-bottom: 12px;
+}
+
+.spotify-container .track-name {
+    font-weight: 600;
+    font-size: 14px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.spotify-container .artist-name {
+    color: #888888;
+    font-size: 13px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 14px;
+}
+
+.spotify-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+}
+
+.spotify-controls button {
+    background: none;
+    border: none;
+    color: #ffffff;
+    cursor: pointer;
+    padding: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.spotify-controls button svg {
+    width: 18px;
+    height: 18px;
+    fill: #ffffff;
+}
+
+.spotify-controls .play-pause {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background-color: #1db954;
+}
+
+.spotify-controls .play-pause svg {
+    width: 16px;
+    height: 16px;
+}
+
+.scheduled-jobs,
+.cron-jobs {
+    max-height: 30vh;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+
+.jobs-container h2 {
+    margin: 0 0 16px 0;
+    font-size: 18px;
+}
+
+.jobs-container h3 {
+    margin: 20px 0 10px 0;
+    font-size: 14px;
+    color: #888888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.jobs-container h3:first-of-type {
+    margin-top: 0;
+}
+
+.job {
+    background-color: #2a2a2a;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+.job .job-name {
+    font-weight: 600;
+    display: block;
+}
+
+.job .job-detail {
+    color: #888888;
+    font-size: 13px;
+    display: block;
+    margin-top: 2px;
+}
+
+.job-empty {
+    color: #666666;
+    font-size: 14px;
+}
+
+.chat-input-bar {
+    margin-top: auto;
+    padding: 12px 16px;
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.chat-input-bar input {
+    flex: 1;
+    background: none;
+    border: none;
+    color: #ffffff;
+    outline: none;
+    font-size: 15px;
+    font-family: inherit;
+}
+
+.chat-input-bar input::placeholder {
+    color: #666666;
+}
+
+.send-button {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background-color: #0084ff;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 0;
+}
+
+.send-button:hover {
+    background-color: #006acc;
+}
+
+.send-button svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: #ffffff;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding-right: 12px;
+}
+
+.message {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    line-height: 1.4;
+}
+
+.message.assistant {
+    align-items: flex-start;
+}
+
+.message .message-body {
+    min-width: 0;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.message .avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    object-fit: cover;
+}
+
+.message .content {
+    color: #dcddde;
+}
+
+.message .content code {
+    background-color: #2a2a2a;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+.message .timestamp {
+    display: block;
+    color: #888888;
+    font-weight: 700;
+    font-size: 13px;
+    margin-bottom: 4px;
+}
+
+.message .thinking {
+    display: block;
+    color: #888888;
+    font-style: italic;
+    margin-bottom: 4px;
+    font-size: 14px;
+}
+
+.message .tool-call {
+    display: block;
+    color: #888888;
+    font-style: italic;
+    margin-bottom: 4px;
+    font-size: 14px;
+}
+
+.message .tool-call b {
+    font-weight: 700;
+}
+
+.message .reasoning,
+.message .reasoning-collapsed {
+    display: block;
+    color: #888888;
+    font-style: italic;
+    margin-bottom: 4px;
+    font-size: 14px;
+}
+
+.collapsible-toggle {
+    cursor: pointer;
+    user-select: none;
+}
+
+.collapsible-toggle:hover {
+    color: #aaaaaa;
+}
+
+.collapsible-arrow {
+    display: inline-block;
+    width: 10px;
+}
+
+.collapsible-body {
+    display: block;
+    margin-top: 4px;
+}

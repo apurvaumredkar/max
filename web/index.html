@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>
+        Max
+    </title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://sdk.scdn.co/spotify-player.js"></script>
+    <script src="/static/app.js" defer></script>
+</head>
+<pre>
+███╗   ███╗ █████╗ ██╗  ██╗
+████╗ ████║██╔══██╗╚██╗██╔╝
+██╔████╔██║███████║ ╚███╔╝
+██║╚██╔╝██║██╔══██║ ██╔██╗
+██║ ╚═╝ ██║██║  ██║██╔╝ ██╗
+╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
+</pre>
+
+<div class="container">
+    <div class="messages"></div>
+    <div class="chat-input-bar">
+        <input type="text">
+        <button class="send-button" aria-label="Send">
+            <svg viewBox="0 0 24 24">
+                <line x1="12" y1="19" x2="12" y2="5"></line>
+                <polyline points="5 12 12 5 19 12"></polyline>
+            </svg>
+        </button>
+    </div>
+</div>
+
+<div class="sidebar">
+    <div class="jobs-container">
+        <h2>Active Jobs</h2>
+        <h3>Scheduled</h3>
+        <div class="scheduled-jobs"></div>
+        <h3>Cron Jobs</h3>
+        <div class="cron-jobs"></div>
+    </div>
+
+    <div class="spotify-container">
+        <button class="spotify-menu-button" aria-label="More options">
+            <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>
+        </button>
+        <div class="spotify-menu">
+            <a href="/max/spotify/authenticate">Authenticate</a>
+        </div>
+        <img class="album-art" src="" alt="">
+        <span class="track-name">Nothing playing</span>
+        <span class="artist-name">&nbsp;</span>
+        <div class="spotify-controls">
+            <button class="spotify-prev" aria-label="Previous">
+                <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+            </button>
+            <button class="spotify-play-pause play-pause" aria-label="Play/Pause">
+                <svg class="icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                <svg class="icon-pause" viewBox="0 0 24 24" style="display:none"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>
+            </button>
+            <button class="spotify-next" aria-label="Next">
+                <svg viewBox="0 0 24 24"><path d="M16 6h2v12h-2zM6 6l8.5 6L6 18z"/></svg>
+            </button>
+        </div>
+    </div>
+</div>
+
+</html>

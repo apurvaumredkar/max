@@ -1,0 +1,13 @@
+[Unit]
+Description=Max Agent
+After=network.target
+
+[Service]
+Type=simple
+User=max
+WorkingDirectory=/home/max/app
+ExecStart=/home/max/.local/bin/uv run main.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
