@@ -25,6 +25,34 @@ body {
     scrollbar-color: #404040 transparent;
 }
 
+/* Scheduled is usually short, so let it size to content and give Cron the
+   remaining space — but both scroll rather than clip if they overflow. */
+.scheduled-jobs {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 6px;
+}
+
+.cron-jobs {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 6px;
+}
+
+/* The last card needs breathing room or it looks clipped at the scroll end. */
+.scheduled-jobs .job:last-child,
+.cron-jobs .job:last-child {
+    margin-bottom: 2px;
+}
+
+.jobs-header,
+.job-form,
+.jobs-container h3 {
+    flex-shrink: 0;
+}
+
 .container::-webkit-scrollbar,
 .jobs-container::-webkit-scrollbar,
 .messages::-webkit-scrollbar,
@@ -97,7 +125,12 @@ pre {
     background-color: #1a1a1a;
     padding: 24px;
     box-sizing: border-box;
-    overflow-y: hidden;
+    /* Flex column so the job lists below can scroll instead of being clipped:
+       the header, form, and section titles keep their size and the lists take
+       the rest. */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
 }
 
 .spotify-container {
@@ -226,7 +259,8 @@ pre {
 
 .scheduled-jobs,
 .cron-jobs {
-    max-height: 30vh;
+    /* No max-height: the flex rules above hand these the container's leftover
+       space. A fixed 30vh cap clipped the list well short of the card's bottom. */
     overflow-y: auto;
     padding-right: 8px;
 }
