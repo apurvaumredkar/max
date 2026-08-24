@@ -6,7 +6,11 @@ Standalone helper, like google_drive.py and spotify.py — Max invokes it throug
 
     python utils/web_search.py "who won the 2026 world cup"
     python utils/web_search.py "latest on the liverpool transfer window" --sources-only
-    python utils/web_search.py "python 3.13 release notes" --resolve-urls
+    python utils/web_search.py "python 3.13 release notes" --json
+
+Output is markdown by default: the answer with inline [1][2] citation markers, then a
+numbered source list. Publisher URLs are resolved by default so the links are quotable.
+Pass --json for the raw structure, --raw-urls to skip redirect resolution.
 
 Requires GEMINI_API_KEY in secrets/.env.
 
@@ -29,6 +33,7 @@ destination at the cost of one HEAD request per source.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -181,9 +186,81 @@ def search(query, model=MODEL, resolve_urls=False):
     }
 
 
+def _domain(uri):
+    """Best-effort hostname for display, minus the www."""
+    match = re.match(r"https?://([^/]+)", uri or "")
+    return match.group(1).replace("www.", "") if match else ""
+
+
+def format_result(result, include_answer=True):
+    """
+    Render a search result as markdown for an LLM to read.
+
+    Raw JSON reads badly here: source URLs are ~200-character redirect blobs that
+    swamp the payload, and citations point at sources by bare index. This inlines
+    those indices as [1][2] markers right after the sentences they support, then
+    lists the numbered sources underneath — the shape a model already knows how to
+    read and cite from.
+    """
+    lines = []
+    answer = result.get("answer", "")
+    sources = result.get("sources", [])
+    citations = result.get("citations", [])
+
+    if include_answer and answer:
+        lines.append(_annotate(answer, citations))
+        lines.append("")
+
+    if sources:
+        lines.append("## Sources")
+        for source in sources:
+            title = source.get("title") or _domain(source.get("uri", "")) or "source"
+            lines.append(f"[{source['index'] + 1}] {title} — {source.get('uri', '')}")
+    else:
+        lines.append("## Sources")
+        lines.append(
+            "(none — this answer was NOT grounded in search results; "
+            "treat it as unverified model output)"
+        )
+
+    queries = result.get("queries") or []
+    if queries:
+        lines.append("")
+        lines.append(f"Searched for: {'; '.join(queries)}")
+
+    return "\n".join(lines).strip()
+
+
+def _annotate(answer, citations):
+    """
+    Append [n] markers to the answer at the end of each cited span.
+
+    Offsets from the API are byte offsets into the UTF-8 answer, and inserting
+    shifts everything after — so work back-to-front over the encoded bytes.
+    """
+    insertions = {}
+    encoded = answer.encode("utf-8")
+    for citation in citations:
+        text = citation.get("text") or ""
+        if not text:
+            continue
+        needle = text.encode("utf-8")
+        position = encoded.find(needle)
+        if position < 0:
+            continue
+        end = position + len(needle)
+        marks = "".join(f"[{index + 1}]" for index in citation.get("sources", []))
+        insertions.setdefault(end, "")
+        insertions[end] += marks
+
+    for end in sorted(insertions, reverse=True):
+        encoded = encoded[:end] + insertions[end].encode("utf-8") + encoded[end:]
+    return encoded.decode("utf-8", errors="replace")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Search the web via Gemini grounding; prints JSON."
+        description="Search the web via Gemini grounding. Prints markdown by default."
     )
     parser.add_argument("query", help="What to search for")
     parser.add_argument("--model", default=MODEL, help=f"Model (default: {MODEL})")
@@ -193,9 +270,14 @@ if __name__ == "__main__":
         help="Print just the sources, omitting the prose answer",
     )
     parser.add_argument(
-        "--resolve-urls",
+        "--json",
         action="store_true",
-        help="Follow redirects to publisher URLs (one request per source)",
+        help="Emit raw JSON instead of markdown",
+    )
+    parser.add_argument(
+        "--raw-urls",
+        action="store_true",
+        help="Keep the grounding redirect URLs instead of resolving to publisher links",
     )
     args = parser.parse_args()
 
@@ -212,12 +294,27 @@ if __name__ == "__main__":
     root.addHandler(stderr_handler)
 
     try:
-        result = search(args.query, model=args.model, resolve_urls=args.resolve_urls)
+        # Redirect blobs are unreadable and unquotable, so resolve by default and
+        # make keeping them the opt-in.
+        result = search(
+            args.query, model=args.model, resolve_urls=not args.raw_urls
+        )
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        if args.json:
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"Search failed: {e}")
         raise SystemExit(1)
 
-    if args.sources_only:
-        print(json.dumps({"sources": result["sources"], "queries": result["queries"]}, indent=2))
+    if args.json:
+        if args.sources_only:
+            print(
+                json.dumps(
+                    {"sources": result["sources"], "queries": result["queries"]},
+                    indent=2,
+                )
+            )
+        else:
+            print(json.dumps(result, indent=2))
     else:
-        print(json.dumps(result, indent=2))
+        print(format_result(result, include_answer=not args.sources_only))
