@@ -91,15 +91,47 @@ def _auth_headers():
     return {"Authorization": f"Bearer {get_access_token()}"}
 
 
+def list_devices():
+    response = requests.get(f"{PLAYER_URL}/devices", headers=_auth_headers())
+    response.raise_for_status()
+    return response.json().get("devices", [])
+
+
 def transfer_playback(device_id):
-    # play=False — claim the device on page load without starting playback. Whatever was
-    # already playing keeps its state; a paused session stays paused.
+    """
+    Claim playback for the web player, but only if no other device already holds it.
+
+    A real device (phone, desktop app) takes priority: if one is active, leave it alone so
+    opening the page never yanks playback away from whatever Apurva is already using. Only
+    when nothing is active does the web player take over — and with play=False, so claiming
+    the device doesn't start music on its own.
+
+    Stale web-player devices from earlier page loads also report as "Max", so our own device
+    is identified by the device_id the SDK handed us, never by name.
+    """
+    try:
+        devices = list_devices()
+    except Exception as e:
+        # Can't tell who's active — err on the side of not stealing playback.
+        print(f"Error listing Spotify devices: {e}")
+        return {"status": "skipped", "reason": "device-list-failed"}
+
+    active = next((d for d in devices if d.get("is_active")), None)
+    if active and active.get("id") != device_id:
+        return {
+            "status": "skipped",
+            "reason": "another-device-active",
+            "active_device": active.get("name"),
+        }
+    if active and active.get("id") == device_id:
+        return {"status": "already-active", "active_device": active.get("name")}
+
     response = requests.put(
         PLAYER_URL,
         headers=_auth_headers(),
         json={"device_ids": [device_id], "play": False},
     )
-    return {"status_code": response.status_code}
+    return {"status": "transferred", "status_code": response.status_code}
 
 
 def resume():
@@ -251,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--search", metavar="QUERY", help="Search for a track")
     parser.add_argument("--play", metavar="URI", help="Play a track by its Spotify URI")
     parser.add_argument("--queue", metavar="URI", help="Add a track to the queue by its Spotify URI")
+    parser.add_argument("--devices", action="store_true", help="List available Spotify devices")
     args = parser.parse_args()
 
     if args.resume:
@@ -269,5 +302,7 @@ if __name__ == "__main__":
         print(json.dumps(play_track(args.play)))
     elif args.queue:
         print(json.dumps(add_to_queue(args.queue)))
+    elif args.devices:
+        print(json.dumps(list_devices(), indent=2))
     else:
         parser.print_help()
