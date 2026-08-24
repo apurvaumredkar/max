@@ -16,6 +16,8 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     log.info("Max agent started")
     agent.backfill_turn_ids()
+    agent.backfill_job_ids()
+    agent.sync_crontab_on_startup()
     yield
     log.info("Max agent shutting down")
 

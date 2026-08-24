@@ -295,10 +295,63 @@ document.addEventListener('DOMContentLoaded', () => {
 
     loadHistory().then(reattachIfGenerating);
 
+    // --- Schedule presets, shared with the form's dropdown ---
+
+    const SCHEDULE_LABELS = {
+        '0 9 * * *': 'Every day at 9:00 AM',
+        '0 8-23 * * *': 'Every hour, 8 AM – 11 PM',
+        '15 7 * * 1-5': 'Weekdays at 7:15 AM',
+        '0 18 * * 1-5': 'Weekdays at 6:00 PM',
+        '0 12 * * *': 'Every day at noon',
+        '0 22 * * *': 'Every day at 10:00 PM',
+        '0 10 * * 6': 'Saturdays at 10:00 AM',
+        '0 10 1 * *': 'Monthly, 1st at 10:00 AM'
+    };
+
+    const DAY_NAMES = { 0: 'Sun', 1: 'Mon', 2: 'Tue', 3: 'Wed', 4: 'Thu', 5: 'Fri', 6: 'Sat' };
+
+    function describeSchedule(expr) {
+        if (SCHEDULE_LABELS[expr]) return SCHEDULE_LABELS[expr];
+        // Best-effort plain English for expressions typed by hand or written by Max.
+        const parts = (expr || '').trim().split(/\s+/);
+        if (parts.length !== 5) return expr;
+        const [min, hour, dom, month, dow] = parts;
+        if (!/^\d+$/.test(min) || !/^\d+$/.test(hour)) return expr;
+        const time = formatClock(Number(hour), Number(min));
+        if (dom === '*' && month === '*' && dow === '*') return `Every day at ${time}`;
+        if (dom === '*' && month === '*' && /^\d(-\d)?$/.test(dow)) {
+            const [from, to] = dow.split('-');
+            const range = to ? `${DAY_NAMES[from]}–${DAY_NAMES[to]}` : DAY_NAMES[from];
+            return `${range} at ${time}`;
+        }
+        if (/^\d+$/.test(dom) && month === '*') return `Monthly, day ${dom} at ${time}`;
+        if (/^\d+$/.test(dom) && /^\d+$/.test(month)) {
+            return `Yearly on ${month}/${dom} at ${time}`;
+        }
+        return expr;
+    }
+
+    function formatClock(hour, minute) {
+        const suffix = hour < 12 ? 'AM' : 'PM';
+        const h = hour % 12 === 0 ? 12 : hour % 12;
+        return `${h}:${String(minute).padStart(2, '0')} ${suffix}`;
+    }
+
+    function describeRunAt(runAt) {
+        const parsed = new Date(String(runAt).replace(' ', 'T'));
+        if (isNaN(parsed)) return runAt;
+        return parsed.toLocaleString('en-US', {
+            month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+        });
+    }
+
     function renderJobs(containerEl, jobs, detailFn) {
-        containerEl.innerHTML = '';
+        containerEl.replaceChildren();
         if (!jobs || jobs.length === 0) {
-            containerEl.innerHTML = '<div class="job-empty">No jobs</div>';
+            const empty = document.createElement('div');
+            empty.className = 'job-empty';
+            empty.textContent = 'No jobs';
+            containerEl.appendChild(empty);
             return;
         }
         jobs.forEach((job) => {
@@ -307,26 +360,167 @@ document.addEventListener('DOMContentLoaded', () => {
             jobEl.innerHTML = `
                 <span class="job-name"></span>
                 <span class="job-detail"></span>
+                <span class="job-actions">
+                    <button class="job-edit" title="Edit">edit</button>
+                    <button class="job-delete" title="Delete">\u00d7</button>
+                </span>
             `;
             jobEl.querySelector('.job-name').textContent = job.name;
             jobEl.querySelector('.job-detail').textContent = detailFn(job);
+            jobEl.title = job.prompt || '';
+            jobEl.querySelector('.job-edit').addEventListener('click', () => openJobForm(job));
+            jobEl.querySelector('.job-delete').addEventListener('click', (event) =>
+                confirmDeleteJob(event.currentTarget, job)
+            );
             containerEl.appendChild(jobEl);
         });
     }
+
+    async function confirmDeleteJob(button, job) {
+        if (!button.classList.contains('confirming')) {
+            button.classList.add('confirming');
+            button.textContent = 'delete?';
+            setTimeout(() => {
+                if (button.classList.contains('confirming')) {
+                    button.classList.remove('confirming');
+                    button.textContent = '\u00d7';
+                }
+            }, 3000);
+            return;
+        }
+        button.disabled = true;
+        try {
+            const result = await fetch(`/max/jobs/${job.id}`, { method: 'DELETE' })
+                .then((r) => r.json());
+            if (result.ok) {
+                loadJobs();
+            } else {
+                button.disabled = false;
+                button.classList.remove('confirming');
+                button.textContent = '\u00d7';
+                console.error('Delete failed:', result.error);
+            }
+        } catch (error) {
+            button.disabled = false;
+            button.classList.remove('confirming');
+            button.textContent = '\u00d7';
+            console.error('Error deleting job:', error);
+        }
+    }
+
+    // --- Add / edit form ---
+
+    const jobForm = document.querySelector('.job-form');
+    const presetSelect = jobForm.querySelector('.job-field-preset');
+    const scheduleInput = jobForm.querySelector('.job-field-schedule');
+    const runAtInput = jobForm.querySelector('.job-field-runat');
+    const nameInput = jobForm.querySelector('.job-field-name');
+    const promptInput = jobForm.querySelector('.job-field-prompt');
+    const formError = jobForm.querySelector('.job-form-error');
+    let editingJobId = null;
+
+    function syncPresetFields() {
+        const value = presetSelect.value;
+        scheduleInput.hidden = value !== '__custom__';
+        runAtInput.hidden = value !== '__once__';
+    }
+
+    presetSelect.addEventListener('change', syncPresetFields);
+
+    function openJobForm(job) {
+        editingJobId = job ? job.id : null;
+        formError.textContent = '';
+        nameInput.value = job ? job.name : '';
+        promptInput.value = job ? job.prompt : '';
+        if (job && job.run_at) {
+            presetSelect.value = '__once__';
+            runAtInput.value = String(job.run_at).replace(' ', 'T');
+        } else if (job && job.schedule) {
+            if (SCHEDULE_LABELS[job.schedule]) {
+                presetSelect.value = job.schedule;
+            } else {
+                presetSelect.value = '__custom__';
+                scheduleInput.value = job.schedule;
+            }
+        } else {
+            presetSelect.selectedIndex = 0;
+            scheduleInput.value = '';
+            runAtInput.value = '';
+        }
+        syncPresetFields();
+        jobForm.querySelector('.job-save').textContent = job ? 'Update' : 'Create';
+        jobForm.hidden = false;
+        nameInput.focus();
+    }
+
+    function closeJobForm() {
+        jobForm.hidden = true;
+        editingJobId = null;
+        formError.textContent = '';
+    }
+
+    document.querySelector('.job-add-button').addEventListener('click', () => {
+        if (jobForm.hidden) openJobForm(null);
+        else closeJobForm();
+    });
+
+    jobForm.querySelector('.job-cancel').addEventListener('click', closeJobForm);
+
+    jobForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const payload = {
+            name: nameInput.value.trim(),
+            prompt: promptInput.value.trim()
+        };
+        const preset = presetSelect.value;
+        if (preset === '__once__') {
+            // datetime-local gives "YYYY-MM-DDTHH:MM"; the API wants a space.
+            payload.run_at = runAtInput.value.replace('T', ' ').slice(0, 16);
+        } else if (preset === '__custom__') {
+            payload.schedule = scheduleInput.value.trim();
+        } else {
+            payload.schedule = preset;
+        }
+        const saveButton = jobForm.querySelector('.job-save');
+        saveButton.disabled = true;
+        formError.textContent = '';
+        try {
+            const url = editingJobId ? `/max/jobs/${editingJobId}` : '/max/jobs';
+            const result = await fetch(url, {
+                method: editingJobId ? 'PUT' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }).then((r) => r.json());
+            if (result.ok) {
+                closeJobForm();
+                loadJobs();
+            } else {
+                formError.textContent = result.error || 'Save failed';
+            }
+        } catch (error) {
+            formError.textContent = 'Save failed';
+            console.error('Error saving job:', error);
+        } finally {
+            saveButton.disabled = false;
+        }
+    });
 
     async function loadJobs() {
         try {
             const response = await fetch('/max/jobs');
             const jobs = await response.json();
-            renderJobs(document.querySelector('.scheduled-jobs'), jobs.scheduled, (job) => `${job.run_at} — ${job.prompt}`);
-            renderJobs(document.querySelector('.cron-jobs'), jobs.cron, (job) => `${job.schedule} — ${job.prompt}`);
+            renderJobs(document.querySelector('.scheduled-jobs'), jobs.scheduled, (job) => describeRunAt(job.run_at));
+            renderJobs(document.querySelector('.cron-jobs'), jobs.cron, (job) => describeSchedule(job.schedule));
         } catch (error) {
             console.error('Error loading jobs:', error);
         }
     }
 
     loadJobs();
-    setInterval(loadJobs, 5000);
+    // Skip the refresh while the form is open, so polling can't clobber what's being typed.
+    setInterval(() => {
+        if (jobForm.hidden) loadJobs();
+    }, 5000);
 
     async function loadNowPlaying() {
         try {

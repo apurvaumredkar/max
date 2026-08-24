@@ -55,7 +55,36 @@
 
 <div class="sidebar">
     <div class="jobs-container">
-        <h2>Active Jobs</h2>
+        <div class="jobs-header">
+            <h2>Active Jobs</h2>
+            <button class="job-add-button" aria-label="Add job" title="Add job">+</button>
+        </div>
+
+        <form class="job-form" hidden>
+            <input type="text" class="job-field-name" placeholder="Name" maxlength="60">
+            <select class="job-field-preset">
+                <option value="0 9 * * *">Every day at 9:00 AM</option>
+                <option value="0 8-23 * * *">Every hour, 8 AM – 11 PM</option>
+                <option value="15 7 * * 1-5">Weekdays at 7:15 AM</option>
+                <option value="0 18 * * 1-5">Weekdays at 6:00 PM</option>
+                <option value="0 12 * * *">Every day at noon</option>
+                <option value="0 22 * * *">Every day at 10:00 PM</option>
+                <option value="0 10 * * 6">Saturdays at 10:00 AM</option>
+                <option value="0 10 1 * *">Monthly, 1st at 10:00 AM</option>
+                <option value="__once__">One time only…</option>
+                <option value="__custom__">Custom cron…</option>
+            </select>
+            <input type="text" class="job-field-schedule" placeholder="0 9 * * *" hidden>
+            <input type="datetime-local" class="job-field-runat" hidden>
+            <textarea class="job-field-prompt" rows="3"
+                placeholder="What should Max say, and why? (a note to itself, not a literal message)"></textarea>
+            <div class="job-form-actions">
+                <span class="job-form-error"></span>
+                <button type="button" class="job-cancel">Cancel</button>
+                <button type="submit" class="job-save">Save</button>
+            </div>
+        </form>
+
         <h3>Scheduled</h3>
         <div class="scheduled-jobs"></div>
         <h3>Cron Jobs</h3>

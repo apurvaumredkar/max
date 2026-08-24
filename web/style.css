@@ -657,3 +657,166 @@ pre {
     position: relative;
     padding-right: 28px;
 }
+
+/* --- Job add / edit --- */
+
+.jobs-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.job-add-button {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 15px;
+    line-height: 1;
+    width: 24px;
+    height: 24px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.job-add-button:hover {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.job-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 14px;
+    padding: 12px;
+    background-color: #222222;
+    border: 1px solid #333333;
+    border-radius: 14px;
+}
+
+.job-form[hidden] {
+    display: none;
+}
+
+.job-form input,
+.job-form select,
+.job-form textarea {
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 8px;
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 8px;
+    outline: none;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.job-form textarea {
+    resize: vertical;
+    line-height: 1.4;
+}
+
+.job-form input:focus,
+.job-form select:focus,
+.job-form textarea:focus {
+    border-color: #666666;
+}
+
+.job-form input::placeholder,
+.job-form textarea::placeholder {
+    color: #666666;
+}
+
+.job-form-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.job-form-error {
+    flex: 1;
+    color: #ff6b6b;
+    font-size: 11px;
+    line-height: 1.3;
+}
+
+.job-cancel,
+.job-save {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 4px 12px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.job-save {
+    background-color: #ffffff;
+    border-color: #ffffff;
+    color: #000000;
+    font-weight: 600;
+}
+
+.job-cancel:hover {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.job-save:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.job {
+    position: relative;
+}
+
+.job-actions {
+    position: absolute;
+    top: 0;
+    right: 0;
+    display: flex;
+    gap: 4px;
+    opacity: 0;
+    transition: opacity 0.12s;
+}
+
+.job:hover .job-actions {
+    opacity: 1;
+}
+
+.job-edit,
+.job-delete {
+    background-color: #1a1a1a;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 7px;
+    cursor: pointer;
+}
+
+.job-edit:hover {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.job-delete:hover,
+.job-delete.confirming {
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+}
+
+.job-delete:disabled {
+    opacity: 0.5;
+    cursor: default;
+}

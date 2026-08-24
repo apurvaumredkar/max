@@ -256,16 +256,84 @@ def _save_jobs(jobs: dict):
         log.error("Failed to write jobs file %s: %s", filename, e)
 
 
-def _install_crontab_line(line: str):
+MANAGED_BEGIN = "# BEGIN max-agent jobs (managed — edited via the web UI)"
+MANAGED_END = "# END max-agent jobs"
+
+
+def _sync_crontab():
+    """
+    Regenerate the managed block of the crontab from jobs.json.
+
+    jobs.json is the source of truth; the crontab is derived. Appending lines per job (the
+    old approach) let the two drift — deleting a job left its cron line behind forever.
+    Anything outside the managed markers is another tool's and is preserved verbatim.
+    """
     existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-    updated = existing + line + "\n"
+    lines = existing.splitlines()
+
+    preserved, inside, adopted = [], False, 0
+    for line in lines:
+        if line.strip() == MANAGED_BEGIN:
+            inside = True
+            continue
+        if line.strip() == MANAGED_END:
+            inside = False
+            continue
+        if inside:
+            continue
+        # Legacy lines from before the managed block existed: these were appended per job
+        # and never removed, so they duplicate what jobs.json now generates. Drop them —
+        # jobs.json is the source of truth. Unrelated crontab entries are preserved.
+        if JOB_TRIGGER_URL in line:
+            adopted += 1
+            continue
+        preserved.append(line)
+    if adopted:
+        log.info("Dropped %d legacy unmanaged job-trigger line(s)", adopted)
+
+    jobs = _load_jobs()
+    managed = [MANAGED_BEGIN]
+    for job in jobs.get("cron", []):
+        managed.append(
+            f"{job['schedule']} "
+            f"{_job_trigger_command(job['prompt'], job.get('channel', 'reminders'))}"
+        )
+    for job in jobs.get("scheduled", []):
+        schedule = _run_at_to_cron(job["run_at"])
+        if not schedule:
+            continue
+        managed.append(
+            f"{schedule} "
+            f"{_job_trigger_command(job['prompt'], job.get('channel', 'reminders'))}"
+        )
+    managed.append(MANAGED_END)
+
+    while preserved and not preserved[-1].strip():
+        preserved.pop()
+    updated = "\n".join(preserved + managed) + "\n"
+
     result = subprocess.run(
         ["crontab", "-"], input=updated, capture_output=True, text=True
     )
     if result.returncode != 0:
-        log.error("Failed to install crontab line %r: %s", line, result.stderr.strip())
-    else:
-        log.info("Installed crontab line: %s", line)
+        log.error("Failed to sync crontab: %s", result.stderr.strip())
+        return False
+    log.info(
+        "Crontab synced: %d cron + %d scheduled job(s)",
+        len(jobs.get("cron", [])),
+        len(jobs.get("scheduled", [])),
+    )
+    return True
+
+
+def _run_at_to_cron(run_at: str):
+    """Convert "YYYY-MM-DD HH:MM" to a 5-field cron expression, or None if unparseable."""
+    try:
+        dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M")
+    except ValueError:
+        log.error("Unparseable run_at %r", run_at)
+        return None
+    return f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
 
 
 SYSTEM_TRIGGER_PREFIX = "[THIS IS AN AUTOMATED SYSTEM TRIGGER]"
@@ -298,13 +366,18 @@ def _cron(name: str, schedule: str, prompt: str, channel: str = "reminders"):
         channel: The Discord channel key, as configured in context/discord.json. Defaults to
             "reminders" — only use another value if the user names a different configured channel.
     """
-    command = _job_trigger_command(prompt, channel)
-    _install_crontab_line(f"{schedule} {command}")
     jobs = _load_jobs()
     jobs["cron"].append(
-        {"name": name, "schedule": schedule, "prompt": prompt, "channel": channel}
+        {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "schedule": schedule,
+            "prompt": prompt,
+            "channel": channel,
+        }
     )
     _save_jobs(jobs)
+    _sync_crontab()
     log.info("Cron job created: %r schedule=%r channel=%s", name, schedule, channel)
     return {"status": "created", "name": name, "schedule": schedule, "prompt": prompt}
 
@@ -322,15 +395,19 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
         channel: The Discord channel key, as configured in context/discord.json. Defaults to
             "reminders" — only use another value if the user names a different configured channel.
     """
-    dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M")
-    schedule = f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
-    command = _job_trigger_command(prompt, channel)
-    _install_crontab_line(f"{schedule} {command}")
+    datetime.strptime(run_at, "%Y-%m-%d %H:%M")  # validate early
     jobs = _load_jobs()
     jobs["scheduled"].append(
-        {"name": name, "run_at": run_at, "prompt": prompt, "channel": channel}
+        {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "run_at": run_at,
+            "prompt": prompt,
+            "channel": channel,
+        }
     )
     _save_jobs(jobs)
+    _sync_crontab()
     log.info("Scheduled job created: %r run_at=%s channel=%s", name, run_at, channel)
     return {"status": "created", "name": name, "run_at": run_at, "prompt": prompt}
 
@@ -378,9 +455,134 @@ async def delete_history_turn(turn_id: str):
     return {"deleted": deleted, "id": turn_id}
 
 
+def sync_crontab_on_startup():
+    """
+    Bring the crontab in line with jobs.json at boot.
+
+    Historically jobs were appended to the crontab and never removed, so the two drifted.
+    Syncing here means a deleted job's cron line can't outlive it.
+    """
+    return _sync_crontab()
+
+
+def backfill_job_ids():
+    """Stamp ids on jobs written before ids existed, so the UI can address them."""
+    jobs = _load_jobs()
+    updated = 0
+    for kind in ("cron", "scheduled"):
+        for job in jobs.get(kind, []):
+            if not job.get("id"):
+                job["id"] = uuid.uuid4().hex
+                updated += 1
+    if updated:
+        _save_jobs(jobs)
+        log.info("Backfilled %d job id(s)", updated)
+    return updated
+
+
+def _find_job(jobs, job_id):
+    """Return (kind, index) for a job id, or (None, None)."""
+    for kind in ("cron", "scheduled"):
+        for index, job in enumerate(jobs.get(kind, [])):
+            if job.get("id") == job_id:
+                return kind, index
+    return None, None
+
+
+def _validate_job(kind, payload):
+    """Return an error string if the payload is unusable, else None."""
+    if not (payload.get("name") or "").strip():
+        return "Name is required"
+    if not (payload.get("prompt") or "").strip():
+        return "Prompt is required"
+    if kind == "cron":
+        schedule = (payload.get("schedule") or "").strip()
+        if len(schedule.split()) != 5:
+            return "Schedule must be a 5-field cron expression"
+    else:
+        try:
+            datetime.strptime((payload.get("run_at") or "").strip(), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return "run_at must be 'YYYY-MM-DD HH:MM'"
+    return None
+
+
 @router.get("/jobs")
 async def jobs():
     return _load_jobs()
+
+
+@router.post("/jobs")
+async def create_job(payload: dict = Body(...)):
+    kind = "scheduled" if payload.get("run_at") else "cron"
+    error = _validate_job(kind, payload)
+    if error:
+        log.warning("Rejected job create: %s", error)
+        return {"ok": False, "error": error}
+    job = {
+        "id": uuid.uuid4().hex,
+        "name": payload["name"].strip(),
+        "prompt": payload["prompt"].strip(),
+        "channel": (payload.get("channel") or "reminders").strip(),
+    }
+    if kind == "cron":
+        job["schedule"] = payload["schedule"].strip()
+    else:
+        job["run_at"] = payload["run_at"].strip()
+    jobs = _load_jobs()
+    jobs.setdefault(kind, []).append(job)
+    _save_jobs(jobs)
+    if not _sync_crontab():
+        return {"ok": False, "error": "Job saved but crontab sync failed"}
+    log.info("Job created via UI: %r (%s)", job["name"], kind)
+    return {"ok": True, "job": job}
+
+
+@router.put("/jobs/{job_id}")
+async def update_job(job_id: str, payload: dict = Body(...)):
+    jobs = _load_jobs()
+    kind, index = _find_job(jobs, job_id)
+    if kind is None:
+        log.warning("Update requested for unknown job id %s", job_id)
+        return {"ok": False, "error": "Job not found"}
+    # A job can switch kind — a recurring reminder becoming a one-off, or vice versa.
+    new_kind = "scheduled" if payload.get("run_at") else "cron"
+    error = _validate_job(new_kind, payload)
+    if error:
+        log.warning("Rejected job update: %s", error)
+        return {"ok": False, "error": error}
+    job = {
+        "id": job_id,
+        "name": payload["name"].strip(),
+        "prompt": payload["prompt"].strip(),
+        "channel": (payload.get("channel") or "reminders").strip(),
+    }
+    if new_kind == "cron":
+        job["schedule"] = payload["schedule"].strip()
+    else:
+        job["run_at"] = payload["run_at"].strip()
+    jobs[kind].pop(index)
+    jobs.setdefault(new_kind, []).append(job)
+    _save_jobs(jobs)
+    if not _sync_crontab():
+        return {"ok": False, "error": "Job saved but crontab sync failed"}
+    log.info("Job updated via UI: %r (%s)", job["name"], new_kind)
+    return {"ok": True, "job": job}
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    jobs = _load_jobs()
+    kind, index = _find_job(jobs, job_id)
+    if kind is None:
+        log.warning("Delete requested for unknown job id %s", job_id)
+        return {"ok": False, "error": "Job not found"}
+    removed = jobs[kind].pop(index)
+    _save_jobs(jobs)
+    if not _sync_crontab():
+        return {"ok": False, "error": "Job removed but crontab sync failed"}
+    log.info("Job deleted via UI: %r (%s)", removed.get("name"), kind)
+    return {"ok": True, "deleted": removed}
 
 
 AVAILABLE_TOOLS = {
