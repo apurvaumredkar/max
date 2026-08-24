@@ -878,9 +878,10 @@ async def chat(user_input: str = Body(embed=True)):
         )
     generation = _Generation(user_input)
     _current_generation = generation
-    # shield() so the task outlives the request that started it: a client disconnect
-    # cancels the response, not the generation.
-    generation.task = asyncio.create_task(asyncio.shield(generation.run()))
+    # A bare task already outlives the request that started it: the disconnect cancels
+    # the StreamingResponse, not this task. (Wrapping it in shield() was a bug —
+    # create_task() needs a coroutine and shield() returns a Future.)
+    generation.task = asyncio.create_task(generation.run())
     return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
 
 
