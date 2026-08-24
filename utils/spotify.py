@@ -97,6 +97,26 @@ def list_devices():
     return response.json().get("devices", [])
 
 
+def available_devices():
+    """
+    List the Spotify devices currently available to play on, e.g. to honour "play X on my iPad".
+
+    Each result has the device id, name, type, whether it is currently active, and whether it is
+    restricted (restricted devices cannot be controlled through the API). Match the user's wording
+    against the name/type, then pass that device's id to play_track.
+    """
+    return [
+        {
+            "id": device.get("id"),
+            "name": device.get("name"),
+            "type": device.get("type"),
+            "is_active": device.get("is_active", False),
+            "is_restricted": device.get("is_restricted", False),
+        }
+        for device in list_devices()
+    ]
+
+
 def transfer_playback(device_id):
     """
     Claim playback for the web player, but only if no other device already holds it.
@@ -180,34 +200,42 @@ def search_track(query, limit=5):
     ]
 
 
-def play_track(uri):
+def play_track(uri, device_id=None):
     """
     Start playback of a specific track by its Spotify URI.
 
     Args:
         uri: The track's Spotify URI, e.g. "spotify:track:3JTLIzNfTYNPqOc7ZzrO4A" — get this
             from search_track first if you only have a song name.
+        device_id: Optional device to play on, from available_devices. Omit to use whatever
+            device is currently active.
     """
     response = requests.put(
         f"{PLAYER_URL}/play",
         headers=_auth_headers(),
+        params={"device_id": device_id} if device_id else None,
         json={"uris": [uri]},
     )
     return {"status_code": response.status_code}
 
 
-def add_to_queue(uri):
+def add_to_queue(uri, device_id=None):
     """
     Add a track to the end of the current playback queue.
 
     Args:
         uri: The track's Spotify URI, e.g. "spotify:track:3JTLIzNfTYNPqOc7ZzrO4A" — get this
             from search_track first if you only have a song name.
+        device_id: Optional device whose queue to add to, from available_devices. Omit to use
+            whatever device is currently active.
     """
+    params = {"uri": uri}
+    if device_id:
+        params["device_id"] = device_id
     response = requests.post(
         f"{PLAYER_URL}/queue",
         headers=_auth_headers(),
-        params={"uri": uri},
+        params=params,
     )
     return {"status_code": response.status_code}
 
@@ -284,6 +312,7 @@ if __name__ == "__main__":
     parser.add_argument("--play", metavar="URI", help="Play a track by its Spotify URI")
     parser.add_argument("--queue", metavar="URI", help="Add a track to the queue by its Spotify URI")
     parser.add_argument("--devices", action="store_true", help="List available Spotify devices")
+    parser.add_argument("--device-id", metavar="ID", help="Target a specific device for --play/--queue")
     args = parser.parse_args()
 
     if args.resume:
@@ -299,10 +328,10 @@ if __name__ == "__main__":
     elif args.search:
         print(json.dumps(search_track(args.search)))
     elif args.play:
-        print(json.dumps(play_track(args.play)))
+        print(json.dumps(play_track(args.play, args.device_id)))
     elif args.queue:
-        print(json.dumps(add_to_queue(args.queue)))
+        print(json.dumps(add_to_queue(args.queue, args.device_id)))
     elif args.devices:
-        print(json.dumps(list_devices(), indent=2))
+        print(json.dumps(available_devices(), indent=2))
     else:
         parser.print_help()
