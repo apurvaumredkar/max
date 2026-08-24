@@ -6,7 +6,9 @@ import subprocess
 import shlex
 from dotenv import load_dotenv
 from datetime import datetime
+import asyncio
 import json
+import uuid
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 from utils.discord_functions import send_discord_message
@@ -74,6 +76,82 @@ def _load_all_history(exclude_files=()):
     return turns
 
 
+def backfill_turn_ids():
+    """
+    Give any pre-existing turn an id, rewriting the file in place.
+
+    Turns written before ids existed can't be addressed for deletion, so stamp them once
+    on startup. Returns the number of turns updated.
+    """
+    if not os.path.isdir("chats"):
+        return 0
+    updated = 0
+    for filename in sorted(os.listdir("chats")):
+        if not filename.endswith(".jsonl"):
+            continue
+        path = f"chats/{filename}"
+        try:
+            with open(path, "r") as chats:
+                turns = [json.loads(line) for line in chats if line.strip()]
+        except Exception as e:
+            log.error("Failed to read %s for id backfill: %s", path, e)
+            continue
+        missing = [turn for turn in turns if not turn.get("id")]
+        if not missing:
+            continue
+        for turn in missing:
+            turn["id"] = uuid.uuid4().hex
+        try:
+            _rewrite_turns(path, turns)
+            updated += len(missing)
+            log.info("Backfilled %d turn ids in %s", len(missing), path)
+        except Exception as e:
+            log.error("Failed to backfill ids in %s: %s", path, e)
+    return updated
+
+
+def _rewrite_turns(path, turns):
+    """Atomically replace a chat file's contents — write a temp file, then rename over."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as tmp:
+        for turn in turns:
+            tmp.write(json.dumps(turn) + "\n")
+    os.replace(tmp_path, path)
+
+
+def _delete_turn(turn_id: str):
+    """
+    Remove the turn with this id from whichever chat file holds it.
+
+    Returns True if a turn was deleted. Rewrites atomically so a crash mid-write can't
+    truncate the day's history.
+    """
+    if not os.path.isdir("chats"):
+        return False
+    for filename in sorted(os.listdir("chats")):
+        if not filename.endswith(".jsonl"):
+            continue
+        path = f"chats/{filename}"
+        try:
+            with open(path, "r") as chats:
+                turns = [json.loads(line) for line in chats if line.strip()]
+        except Exception as e:
+            log.error("Failed to read %s while deleting turn: %s", path, e)
+            continue
+        remaining = [turn for turn in turns if turn.get("id") != turn_id]
+        if len(remaining) == len(turns):
+            continue
+        try:
+            _rewrite_turns(path, remaining)
+        except Exception as e:
+            log.error("Failed to rewrite %s while deleting turn: %s", path, e)
+            return False
+        log.info("Deleted turn %s from %s", turn_id, path)
+        return True
+    log.warning("Delete requested for unknown turn id %s", turn_id)
+    return False
+
+
 def _load_past_history():
     today_file = f"{datetime.today().strftime('%Y%m%d')}.jsonl"
     return _load_all_history(exclude_files={today_file})
@@ -122,7 +200,13 @@ def _search_history(query: str, top_k: int = 5):
 def _save_turn(turn: dict):
     d = datetime.today().strftime("%Y%m%d")
     filename = f"chats/{d}.jsonl"
-    turn = {**turn, "timestamp": datetime.now().strftime("%B %d, %Y %I:%M %p")}
+    # Stable per-turn id so the UI can delete a specific turn. Line numbers won't do —
+    # they shift as soon as anything above is removed.
+    turn = {
+        "id": turn.get("id") or uuid.uuid4().hex,
+        **turn,
+        "timestamp": datetime.now().strftime("%B %d, %Y %I:%M %p"),
+    }
     try:
         with open(filename, "a") as chats:
             chats.write(json.dumps(turn) + "\n")
@@ -288,6 +372,12 @@ async def history():
     return _load_all_history()
 
 
+@router.delete("/history/{turn_id}")
+async def delete_history_turn(turn_id: str):
+    deleted = _delete_turn(turn_id)
+    return {"deleted": deleted, "id": turn_id}
+
+
 @router.get("/jobs")
 async def jobs():
     return _load_jobs()
@@ -392,6 +482,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
 
 
 async def _generate_reply_stream(user_input: str):
+    """Yield event dicts; the caller serializes them for the wire."""
     log.info("Chat request: %d chars", len(user_input))
     persona = _load_persona()
     _save_turn({"role": "user", "content": user_input})
@@ -422,10 +513,10 @@ async def _generate_reply_stream(user_input: str):
             reasoning = getattr(delta, "reasoning", None)
             if reasoning:
                 round_thinking += reasoning
-                yield json.dumps({"type": "thinking", "delta": reasoning}) + "\n"
+                yield {"type": "thinking", "delta": reasoning}
             if delta.content:
                 round_content += delta.content
-                yield json.dumps({"type": "content", "delta": delta.content}) + "\n"
+                yield {"type": "content", "delta": delta.content}
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     entry = tool_call_chunks.setdefault(
@@ -485,7 +576,7 @@ async def _generate_reply_stream(user_input: str):
                 "output": output,
             }
             tool_calls_log.append(tool_call_record)
-            yield json.dumps({"type": "tool_call", **tool_call_record}) + "\n"
+            yield {"type": "tool_call", **tool_call_record}
             messages.append(
                 {
                     "role": "tool",
@@ -502,14 +593,115 @@ async def _generate_reply_stream(user_input: str):
             "tool_calls": tool_calls_log,
         }
     )
-    yield json.dumps({"type": "done", "turn": turn}) + "\n"
+    yield {"type": "done", "turn": turn}
+
+
+class _Generation:
+    """
+    A single in-flight reply, decoupled from the HTTP request that started it.
+
+    Generation runs as a background task writing events into a buffer, so closing or
+    reloading the page doesn't cancel it — the turn still completes and is saved. A client
+    that (re)connects replays the buffer and then follows live.
+    """
+
+    def __init__(self, user_input):
+        self.user_input = user_input
+        self.events = []
+        self.done = False
+        self.task = None
+        self._waiters = []
+
+    def emit(self, event):
+        self.events.append(event)
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+        self._waiters.clear()
+
+    def finish(self):
+        self.done = True
+        self.emit({"type": "_eof"})
+
+    async def wait_for_event(self, seen):
+        """Block until there are events past index `seen`, or generation is done."""
+        if seen < len(self.events) or self.done:
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        await waiter
+
+    async def run(self):
+        try:
+            async for event in _generate_reply_stream(self.user_input):
+                self.emit(event)
+        except asyncio.CancelledError:
+            log.warning("Generation cancelled")
+            self.emit({"type": "error", "message": "Generation cancelled"})
+            raise
+        except Exception as e:
+            log.exception("Generation failed")
+            self.emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        finally:
+            self.finish()
+
+
+# At most one generation at a time — the agent is single-user and each turn depends on the
+# history the previous one wrote.
+_current_generation = None
+
+
+async def _replay(generation):
+    """Stream a generation's events to one client, from the beginning, then live."""
+    seen = 0
+    while True:
+        await generation.wait_for_event(seen)
+        while seen < len(generation.events):
+            event = generation.events[seen]
+            seen += 1
+            if event.get("type") == "_eof":
+                return
+            yield json.dumps(event) + "\n"
+        if generation.done and seen >= len(generation.events):
+            return
 
 
 @router.post("/chat")
 async def chat(user_input: str = Body(embed=True)):
-    return StreamingResponse(
-        _generate_reply_stream(user_input), media_type="application/x-ndjson"
-    )
+    global _current_generation
+    if _current_generation and not _current_generation.done:
+        log.info("Chat request arrived while a generation is in flight — attaching to it")
+        return StreamingResponse(
+            _replay(_current_generation), media_type="application/x-ndjson"
+        )
+    generation = _Generation(user_input)
+    _current_generation = generation
+    # shield() so the task outlives the request that started it: a client disconnect
+    # cancels the response, not the generation.
+    generation.task = asyncio.create_task(asyncio.shield(generation.run()))
+    return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
+
+
+@router.get("/chat/active")
+async def chat_active():
+    """
+    Report whether a reply is still being generated, so a freshly loaded page can
+    reattach to it instead of missing the rest of the response.
+    """
+    generation = _current_generation
+    if not generation or generation.done:
+        return {"active": False}
+    return {"active": True}
+
+
+@router.get("/chat/attach")
+async def chat_attach():
+    """Reattach to the in-flight generation, replaying everything emitted so far."""
+    generation = _current_generation
+    if not generation or generation.done:
+        return {"active": False}
+    log.info("Client reattached to in-flight generation")
+    return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
 
 
 @router.post("/job-trigger")

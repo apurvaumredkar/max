@@ -61,9 +61,56 @@ document.addEventListener('DOMContentLoaded', () => {
             </div>
         `;
         messageEl.querySelector('.timestamp').textContent = timestamp || formatTimestamp(new Date());
+        messageEl.querySelector('.message-body').appendChild(createDeleteButton(messageEl));
         messagesEl.appendChild(messageEl);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return messageEl;
+    }
+
+    function createDeleteButton(messageEl) {
+        const button = document.createElement('button');
+        button.className = 'message-delete';
+        button.title = 'Delete this message';
+        button.setAttribute('aria-label', 'Delete this message');
+        button.textContent = '\u00d7';
+        button.addEventListener('click', async () => {
+            const turnId = messageEl.dataset.turnId;
+            if (!turnId) {
+                // Never persisted (e.g. a failed send) — just drop it from the view.
+                messageEl.remove();
+                return;
+            }
+            if (button.classList.contains('confirming')) {
+                button.disabled = true;
+                try {
+                    const response = await fetch(`/max/history/${turnId}`, { method: 'DELETE' });
+                    const result = await response.json();
+                    if (result.deleted) {
+                        messageEl.remove();
+                    } else {
+                        button.disabled = false;
+                        button.classList.remove('confirming');
+                        console.error('Turn not found on server:', turnId);
+                    }
+                } catch (error) {
+                    button.disabled = false;
+                    button.classList.remove('confirming');
+                    console.error('Error deleting turn:', error);
+                }
+                return;
+            }
+            // Two-step: first click arms, second click deletes. Cheaper than a modal and
+            // still guards against a stray click destroying history.
+            button.classList.add('confirming');
+            button.textContent = 'delete?';
+            setTimeout(() => {
+                if (button.classList.contains('confirming')) {
+                    button.classList.remove('confirming');
+                    button.textContent = '\u00d7';
+                }
+            }, 3000);
+        });
+        return button;
     }
 
     function createCollapsible(className, headerText) {
@@ -128,8 +175,9 @@ document.addEventListener('DOMContentLoaded', () => {
         reasoningEl.replaceWith(wrapper);
     }
 
-    function addMessage(author, content, thinking, timestamp, toolCalls) {
+    function addMessage(author, content, thinking, timestamp, toolCalls, turnId) {
         const messageEl = createMessageEl(author, timestamp);
+        if (turnId) messageEl.dataset.turnId = turnId;
         if (thinking || (toolCalls || []).length) {
             const reasoningEl = getReasoningEl(messageEl);
             if (thinking) {
@@ -143,6 +191,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         messageEl.querySelector('.content').innerHTML = renderMarkdown(content);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        return messageEl;
     }
 
     async function sendMessage() {
@@ -152,15 +201,22 @@ document.addEventListener('DOMContentLoaded', () => {
         inputField.value = '';
 
         const messageEl = createMessageEl('Max');
-        let contentText = '';
-        let liveThinkingEl = null;
-
         try {
             const response = await fetch('/max/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ user_input: message })
             });
+            await consumeStream(response, messageEl);
+        } catch (error) {
+            console.error('Error sending message:', error);
+        }
+    }
+
+    async function consumeStream(response, messageEl) {
+        let contentText = '';
+        let liveThinkingEl = null;
+        {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
@@ -189,12 +245,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else if (event.type === 'done') {
                         collapseReasoning(messageEl);
                         messageEl.querySelector('.timestamp').textContent = event.turn.timestamp;
+                        if (event.turn.id) messageEl.dataset.turnId = event.turn.id;
+                    } else if (event.type === 'error') {
+                        console.error('Generation error:', event.message);
+                        messageEl.querySelector('.content').textContent =
+                            contentText || `[${event.message}]`;
                     }
                     messagesEl.scrollTop = messagesEl.scrollHeight;
                 }
             }
-        } catch (error) {
-            console.error('Error sending message:', error);
         }
     }
 
@@ -212,14 +271,29 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/max/history');
             const turns = await response.json();
             turns.forEach((turn) => {
-                addMessage(turn.role === 'user' ? 'You' : 'Max', turn.content, turn.thinking, turn.timestamp, turn.tool_calls);
+                addMessage(turn.role === 'user' ? 'You' : 'Max', turn.content, turn.thinking, turn.timestamp, turn.tool_calls, turn.id);
             });
         } catch (error) {
             console.error('Error loading history:', error);
         }
     }
 
-    loadHistory();
+    async function reattachIfGenerating() {
+        // A reload mid-response used to abandon the reply. The server keeps generating, so
+        // pick the stream back up and render the rest into a fresh bubble.
+        try {
+            const status = await fetch('/max/chat/active').then((r) => r.json());
+            if (!status.active) return;
+            const response = await fetch('/max/chat/attach');
+            if (!response.ok || !response.body) return;
+            const messageEl = createMessageEl('Max');
+            await consumeStream(response, messageEl);
+        } catch (error) {
+            console.error('Error reattaching to generation:', error);
+        }
+    }
+
+    loadHistory().then(reattachIfGenerating);
 
     function renderJobs(containerEl, jobs, detailFn) {
         containerEl.innerHTML = '';

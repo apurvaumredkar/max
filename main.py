@@ -15,6 +15,7 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Max agent started")
+    agent.backfill_turn_ids()
     yield
     log.info("Max agent shutting down")
 

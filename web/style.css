@@ -607,3 +607,53 @@ pre {
     color: #666666;
     font-style: italic;
 }
+
+/* --- Per-message delete --- */
+
+.message {
+    position: relative;
+}
+
+.message-delete {
+    position: absolute;
+    top: 0;
+    right: 0;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 50px;
+    color: #555555;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 7px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.message:hover .message-delete,
+.message-delete:focus-visible {
+    opacity: 1;
+}
+
+.message-delete:hover {
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+}
+
+.message-delete.confirming {
+    opacity: 1;
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+    font-size: 11px;
+}
+
+.message-delete:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.message-body {
+    position: relative;
+    padding-right: 28px;
+}
