@@ -170,8 +170,17 @@ def _install_crontab_line(line: str):
     subprocess.run(["crontab", "-"], input=updated, capture_output=True, text=True)
 
 
+SYSTEM_TRIGGER_PREFIX = "[THIS IS AN AUTOMATED SYSTEM TRIGGER]"
+
+
 def _job_trigger_command(prompt: str, channel: str):
-    payload = shlex.quote(json.dumps({"prompt": prompt, "channel": channel}))
+    # The prompt arrives as a user turn when the job fires, so mark it: it is the scheduler
+    # nudging Max, not Apurva speaking.
+    payload = shlex.quote(
+        json.dumps(
+            {"prompt": f"{SYSTEM_TRIGGER_PREFIX} {prompt}", "channel": channel}
+        )
+    )
     return (
         f"curl -s -X POST {JOB_TRIGGER_URL} "
         f"-H 'Content-Type: application/json' -d {payload}"
@@ -226,6 +235,38 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
     return {"status": "created", "name": name, "run_at": run_at, "prompt": prompt}
 
 
+def _jobs_system_message():
+    """
+    Render the currently installed jobs as a system message. Active context is only today's chat,
+    so without this Max cannot see reminders it set on an earlier day and creates duplicates.
+    """
+    jobs = _load_jobs()
+    lines = []
+    for job in jobs.get("cron", []):
+        lines.append(
+            f"- [recurring] {job['name']} — cron \"{job['schedule']}\" "
+            f"→ #{job.get('channel', 'reminders')}: {job['prompt']}"
+        )
+    for job in jobs.get("scheduled", []):
+        lines.append(
+            f"- [one-time] {job['name']} — at {job['run_at']} "
+            f"→ #{job.get('channel', 'reminders')}: {job['prompt']}"
+        )
+    if not lines:
+        body = "There are currently no reminders or scheduled jobs set."
+    else:
+        body = "Reminders and scheduled jobs you have already set:\n" + "\n".join(lines)
+    return {
+        "role": "system",
+        "content": (
+            f"{body}\n\n"
+            "This list is the full set of jobs across all days — your chat context only covers "
+            "today. Check it before creating a new job: if an equivalent one already exists, say "
+            "so instead of creating a duplicate."
+        ),
+    }
+
+
 @router.get("/history")
 async def history():
     return _load_all_history()
@@ -256,7 +297,11 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
         _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [{"role": "system", "content": persona}, *context]
+    messages = [
+        {"role": "system", "content": persona},
+        _jobs_system_message(),
+        *context,
+    ]
     if not save_user_turn:
         messages.append({"role": "user", "content": user_input})
     tool_calls_log = []
@@ -329,7 +374,11 @@ async def _generate_reply_stream(user_input: str):
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [{"role": "system", "content": persona}, *context]
+    messages = [
+        {"role": "system", "content": persona},
+        _jobs_system_message(),
+        *context,
+    ]
     tool_calls_log = []
     content = ""
     thinking = ""

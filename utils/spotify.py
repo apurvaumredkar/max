@@ -92,10 +92,12 @@ def _auth_headers():
 
 
 def transfer_playback(device_id):
+    # play=False — claim the device on page load without starting playback. Whatever was
+    # already playing keeps its state; a paused session stays paused.
     response = requests.put(
         PLAYER_URL,
         headers=_auth_headers(),
-        json={"device_ids": [device_id], "play": True},
+        json={"device_ids": [device_id], "play": False},
     )
     return {"status_code": response.status_code}
 
