@@ -120,18 +120,18 @@ pre {
     position: fixed;
     top: 20px;
     right: 20px;
-    width: 441px;
+    /* No shared width — the cards are sized independently below and right-aligned
+       against this column, so one can be wide without dragging the other along. */
     max-height: calc(100vh - 40px);
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 20px;
 }
 
 .jobs-container {
-    /* 0.75x the height it used to fill: flex:1 stretched this to all the leftover
-       space, so cap it and let the sidebar's spare room sit below instead. */
-    flex: 0 1 auto;
-    height: calc((100vh - 40px) * 0.75);
+    width: 441px;
+    flex: 1 1 auto;
     min-height: 0;
     border-radius: 24px;
     background-color: #1a1a1a;
@@ -146,6 +146,8 @@ pre {
 }
 
 .spotify-container {
+    /* Original width, independent of the jobs card above it. */
+    width: 294px;
     flex-shrink: 0;
     border-radius: 24px;
     background-color: #1a1a1a;
