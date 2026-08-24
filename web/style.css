@@ -71,9 +71,12 @@ pre {
     background-color: #1a1a1a;
     padding: 20px;
     box-sizing: border-box;
-    overflow-y: auto;
+    /* hidden, not auto: .messages is the only scrolling region, so the tab bar and the
+       chat input bar stay put instead of scrolling out of view with the transcript. */
+    overflow: hidden;
     display: flex;
     flex-direction: column;
+    min-height: 0;
 }
 
 .sidebar {
@@ -326,6 +329,7 @@ pre {
 
 .messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -438,27 +442,37 @@ pre {
 }
 
 .tab {
-    padding: 6px 16px;
-    border-radius: 50px;
+    padding: 7px 20px;
+    border-radius: 999px;
     border: 1px solid #404040;
     background-color: #2a2a2a;
     color: #999999;
     font-family: inherit;
-    font-size: 14px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1;
     cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    outline: none;
     transition: background-color 0.15s, color 0.15s, border-color 0.15s;
 }
 
-.tab:hover {
+.tab:hover:not(.active) {
+    background-color: #333333;
     color: #ffffff;
     border-color: #555555;
+}
+
+.tab:focus-visible {
+    box-shadow: 0 0 0 2px #1db954;
 }
 
 .tab.active {
     background-color: #ffffff;
     border-color: #ffffff;
     color: #000000;
-    font-weight: 600;
 }
 
 .tab-panel {
@@ -466,10 +480,17 @@ pre {
     flex: 1;
     min-height: 0;
     flex-direction: column;
+    overflow: hidden;
 }
 
 .tab-panel.active {
     display: flex;
+}
+
+/* Any `display` declaration beats the `hidden` attribute, so state it explicitly —
+   otherwise a hidden-but-.active panel would still render. */
+.tab-panel[hidden] {
+    display: none;
 }
 
 /* --- Logs tab --- */

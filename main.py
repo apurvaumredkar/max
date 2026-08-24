@@ -1,8 +1,9 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 from utils import agent, logs, spotify
@@ -34,9 +35,24 @@ app.mount("/assets", StaticFiles(directory="web/assets"), name="assets")
 app.mount("/static", StaticFiles(directory="web"), name="static")
 
 
+def _asset_version(path):
+    """mtime-based cache buster, so an edited css/js file is never served from cache."""
+    try:
+        return str(int(os.path.getmtime(path)))
+    except OSError:
+        return "0"
+
+
 @app.get("/")
 async def read_index():
-    return FileResponse("web/index.html")
+    # Stamp ?v=<mtime> onto the css/js links so browsers pick up edits immediately
+    # instead of holding a stale copy.
+    with open("web/index.html", "r", encoding="utf-8") as index_file:
+        html = index_file.read()
+    html = html.replace(
+        "/static/style.css", f"/static/style.css?v={_asset_version('web/style.css')}"
+    ).replace("/static/app.js", f"/static/app.js?v={_asset_version('web/app.js')}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/callback")

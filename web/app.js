@@ -306,33 +306,6 @@ document.addEventListener('DOMContentLoaded', () => {
     loadNowPlaying();
     setInterval(loadNowPlaying, 5000);
 
-    // --- Tabs ---
-
-    const tabs = document.querySelectorAll('.tab');
-    const panels = document.querySelectorAll('.tab-panel');
-
-    function activateTab(name) {
-        tabs.forEach((tab) => {
-            const isActive = tab.dataset.tab === name;
-            tab.classList.toggle('active', isActive);
-            tab.setAttribute('aria-selected', String(isActive));
-        });
-        panels.forEach((panel) => {
-            const isActive = panel.dataset.panel === name;
-            panel.classList.toggle('active', isActive);
-            panel.hidden = !isActive;
-        });
-        if (name === 'logs') {
-            openLogStream();
-            scrollLogsToBottom();
-        } else {
-            closeLogStream();
-        }
-        if (name === 'chat') inputField.focus();
-    }
-
-    tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
-
     // --- Logs ---
 
     const logsOutput = document.querySelector('.logs-output');
@@ -402,6 +375,33 @@ document.addEventListener('DOMContentLoaded', () => {
     followToggle.addEventListener('change', () => {
         if (followToggle.checked) scrollLogsToBottom();
     });
+
+    // --- Tabs ---
+
+    const tabs = document.querySelectorAll('.tab');
+    const panels = document.querySelectorAll('.tab-panel');
+
+    function activateTab(name) {
+        tabs.forEach((tab) => {
+            const isActive = tab.dataset.tab === name;
+            tab.classList.toggle('active', isActive);
+            tab.setAttribute('aria-selected', String(isActive));
+        });
+        panels.forEach((panel) => {
+            const isActive = panel.dataset.panel === name;
+            panel.classList.toggle('active', isActive);
+            panel.hidden = !isActive;
+        });
+        if (name === 'logs') {
+            openLogStream();
+            scrollLogsToBottom();
+        } else {
+            closeLogStream();
+        }
+        if (name === 'chat') inputField.focus();
+    }
+
+    tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
 
     // Don't hold a journalctl process open when the tab isn't visible.
     window.addEventListener('beforeunload', closeLogStream);
