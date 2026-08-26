@@ -6,11 +6,9 @@ import subprocess
 import shlex
 from dotenv import load_dotenv
 from datetime import datetime
-import asyncio
 import json
 import uuid
 from fastapi import APIRouter, Body
-from fastapi.responses import StreamingResponse
 from utils.discord_functions import send_discord_message
 from utils.logging_config import get_logger
 
@@ -20,14 +18,42 @@ log = get_logger(__name__)
 
 JOB_TRIGGER_URL = "http://localhost/max/job-trigger"
 
-# OpenAI-compatible client — INFERENCE_HOST_URL/INFERENCE_API_KEY in secrets/.env point this at
-# whichever provider is active (Ollama, OpenRouter, etc). Swap MODEL below to match.
-openai_client = AsyncOpenAI(
-    base_url=os.getenv("INFERENCE_HOST_URL"),
-    api_key=os.getenv("INFERENCE_API_KEY"),
-)
+# Selectable inference backends — the UI's model selector picks a key from here per request.
+# Each is an OpenAI-compatible endpoint; base_url/api_key come from secrets/.env so credentials
+# stay out of source.
+MODEL_OPTIONS = {
+    "openrouter-nemotron": {
+        "label": "OpenRouter · Nemotron 3 Ultra",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "base_url": os.getenv("INFERENCE_HOST_URL"),
+        "api_key": os.getenv("INFERENCE_API_KEY"),
+        # The :free tier's context window (the paid tier is capped at 512,288).
+        "context_length": 1_000_000,
+    },
+    "tailscale-ornith": {
+        "label": "Tailscale Ollama · Ornith 1.5 35B",
+        "model": "ornith-1.5:35b",
+        "base_url": os.getenv("TAILSCALE_OLLAMA_HOST_URL"),
+        "api_key": os.getenv("TAILSCALE_OLLAMA_API_KEY"),
+        "context_length": 262_144,
+    },
+}
+DEFAULT_MODEL_KEY = "openrouter-nemotron"
+
+_openai_clients = {
+    key: AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"])
+    for key, opts in MODEL_OPTIONS.items()
+}
+
+
+def _model_choice(model_key):
+    """Resolve a UI model key to its client + model id + context window, falling back to the default."""
+    key = model_key if model_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
+    opts = MODEL_OPTIONS[key]
+    return _openai_clients[key], opts["model"], opts["context_length"]
+
+
 embed_client = Client(host="http://localhost:11434")
-MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 EMBED_MODEL = "all-minilm"
 
 router = APIRouter()
@@ -74,82 +100,6 @@ def _load_all_history(exclude_files=()):
         except Exception as e:
             log.error("Failed to read history file chats/%s: %s", filename, e)
     return turns
-
-
-def backfill_turn_ids():
-    """
-    Give any pre-existing turn an id, rewriting the file in place.
-
-    Turns written before ids existed can't be addressed for deletion, so stamp them once
-    on startup. Returns the number of turns updated.
-    """
-    if not os.path.isdir("chats"):
-        return 0
-    updated = 0
-    for filename in sorted(os.listdir("chats")):
-        if not filename.endswith(".jsonl"):
-            continue
-        path = f"chats/{filename}"
-        try:
-            with open(path, "r") as chats:
-                turns = [json.loads(line) for line in chats if line.strip()]
-        except Exception as e:
-            log.error("Failed to read %s for id backfill: %s", path, e)
-            continue
-        missing = [turn for turn in turns if not turn.get("id")]
-        if not missing:
-            continue
-        for turn in missing:
-            turn["id"] = uuid.uuid4().hex
-        try:
-            _rewrite_turns(path, turns)
-            updated += len(missing)
-            log.info("Backfilled %d turn ids in %s", len(missing), path)
-        except Exception as e:
-            log.error("Failed to backfill ids in %s: %s", path, e)
-    return updated
-
-
-def _rewrite_turns(path, turns):
-    """Atomically replace a chat file's contents — write a temp file, then rename over."""
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w") as tmp:
-        for turn in turns:
-            tmp.write(json.dumps(turn) + "\n")
-    os.replace(tmp_path, path)
-
-
-def _delete_turn(turn_id: str):
-    """
-    Remove the turn with this id from whichever chat file holds it.
-
-    Returns True if a turn was deleted. Rewrites atomically so a crash mid-write can't
-    truncate the day's history.
-    """
-    if not os.path.isdir("chats"):
-        return False
-    for filename in sorted(os.listdir("chats")):
-        if not filename.endswith(".jsonl"):
-            continue
-        path = f"chats/{filename}"
-        try:
-            with open(path, "r") as chats:
-                turns = [json.loads(line) for line in chats if line.strip()]
-        except Exception as e:
-            log.error("Failed to read %s while deleting turn: %s", path, e)
-            continue
-        remaining = [turn for turn in turns if turn.get("id") != turn_id]
-        if len(remaining) == len(turns):
-            continue
-        try:
-            _rewrite_turns(path, remaining)
-        except Exception as e:
-            log.error("Failed to rewrite %s while deleting turn: %s", path, e)
-            return False
-        log.info("Deleted turn %s from %s", turn_id, path)
-        return True
-    log.warning("Delete requested for unknown turn id %s", turn_id)
-    return False
 
 
 def _load_past_history():
@@ -444,17 +394,6 @@ def _jobs_system_message():
     }
 
 
-@router.get("/history")
-async def history():
-    return _load_all_history()
-
-
-@router.delete("/history/{turn_id}")
-async def delete_history_turn(turn_id: str):
-    deleted = _delete_turn(turn_id)
-    return {"deleted": deleted, "id": turn_id}
-
-
 def sync_crontab_on_startup():
     """
     Bring the crontab in line with jobs.json at boot.
@@ -463,126 +402,6 @@ def sync_crontab_on_startup():
     Syncing here means a deleted job's cron line can't outlive it.
     """
     return _sync_crontab()
-
-
-def backfill_job_ids():
-    """Stamp ids on jobs written before ids existed, so the UI can address them."""
-    jobs = _load_jobs()
-    updated = 0
-    for kind in ("cron", "scheduled"):
-        for job in jobs.get(kind, []):
-            if not job.get("id"):
-                job["id"] = uuid.uuid4().hex
-                updated += 1
-    if updated:
-        _save_jobs(jobs)
-        log.info("Backfilled %d job id(s)", updated)
-    return updated
-
-
-def _find_job(jobs, job_id):
-    """Return (kind, index) for a job id, or (None, None)."""
-    for kind in ("cron", "scheduled"):
-        for index, job in enumerate(jobs.get(kind, [])):
-            if job.get("id") == job_id:
-                return kind, index
-    return None, None
-
-
-def _validate_job(kind, payload):
-    """Return an error string if the payload is unusable, else None."""
-    if not (payload.get("name") or "").strip():
-        return "Name is required"
-    if not (payload.get("prompt") or "").strip():
-        return "Prompt is required"
-    if kind == "cron":
-        schedule = (payload.get("schedule") or "").strip()
-        if len(schedule.split()) != 5:
-            return "Schedule must be a 5-field cron expression"
-    else:
-        try:
-            datetime.strptime((payload.get("run_at") or "").strip(), "%Y-%m-%d %H:%M")
-        except ValueError:
-            return "run_at must be 'YYYY-MM-DD HH:MM'"
-    return None
-
-
-@router.get("/jobs")
-async def jobs():
-    return _load_jobs()
-
-
-@router.post("/jobs")
-async def create_job(payload: dict = Body(...)):
-    kind = "scheduled" if payload.get("run_at") else "cron"
-    error = _validate_job(kind, payload)
-    if error:
-        log.warning("Rejected job create: %s", error)
-        return {"ok": False, "error": error}
-    job = {
-        "id": uuid.uuid4().hex,
-        "name": payload["name"].strip(),
-        "prompt": payload["prompt"].strip(),
-        "channel": (payload.get("channel") or "reminders").strip(),
-    }
-    if kind == "cron":
-        job["schedule"] = payload["schedule"].strip()
-    else:
-        job["run_at"] = payload["run_at"].strip()
-    jobs = _load_jobs()
-    jobs.setdefault(kind, []).append(job)
-    _save_jobs(jobs)
-    if not _sync_crontab():
-        return {"ok": False, "error": "Job saved but crontab sync failed"}
-    log.info("Job created via UI: %r (%s)", job["name"], kind)
-    return {"ok": True, "job": job}
-
-
-@router.put("/jobs/{job_id}")
-async def update_job(job_id: str, payload: dict = Body(...)):
-    jobs = _load_jobs()
-    kind, index = _find_job(jobs, job_id)
-    if kind is None:
-        log.warning("Update requested for unknown job id %s", job_id)
-        return {"ok": False, "error": "Job not found"}
-    # A job can switch kind — a recurring reminder becoming a one-off, or vice versa.
-    new_kind = "scheduled" if payload.get("run_at") else "cron"
-    error = _validate_job(new_kind, payload)
-    if error:
-        log.warning("Rejected job update: %s", error)
-        return {"ok": False, "error": error}
-    job = {
-        "id": job_id,
-        "name": payload["name"].strip(),
-        "prompt": payload["prompt"].strip(),
-        "channel": (payload.get("channel") or "reminders").strip(),
-    }
-    if new_kind == "cron":
-        job["schedule"] = payload["schedule"].strip()
-    else:
-        job["run_at"] = payload["run_at"].strip()
-    jobs[kind].pop(index)
-    jobs.setdefault(new_kind, []).append(job)
-    _save_jobs(jobs)
-    if not _sync_crontab():
-        return {"ok": False, "error": "Job saved but crontab sync failed"}
-    log.info("Job updated via UI: %r (%s)", job["name"], new_kind)
-    return {"ok": True, "job": job}
-
-
-@router.delete("/jobs/{job_id}")
-async def delete_job(job_id: str):
-    jobs = _load_jobs()
-    kind, index = _find_job(jobs, job_id)
-    if kind is None:
-        log.warning("Delete requested for unknown job id %s", job_id)
-        return {"ok": False, "error": "Job not found"}
-    removed = jobs[kind].pop(index)
-    _save_jobs(jobs)
-    if not _sync_crontab():
-        return {"ok": False, "error": "Job removed but crontab sync failed"}
-    log.info("Job deleted via UI: %r (%s)", removed.get("name"), kind)
-    return {"ok": True, "deleted": removed}
 
 
 AVAILABLE_TOOLS = {
@@ -599,8 +418,9 @@ TOOL_SCHEMAS = [
 ]
 
 
-async def _generate_reply(user_input: str, save_user_turn: bool = True):
+async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = DEFAULT_MODEL_KEY):
     log.info("Generating reply (non-streaming, save_user_turn=%s)", save_user_turn)
+    client, model_name, context_length = _model_choice(model_key)
     persona = _load_persona()
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
@@ -616,11 +436,11 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
     tool_calls_log = []
 
     while True:
-        response = await openai_client.chat.completions.create(
-            model=MODEL,
+        response = await client.chat.completions.create(
+            model=model_name,
             messages=messages,
             tools=TOOL_SCHEMAS,
-            extra_body={"options": {"num_ctx": 262144}, "keep_alive": -1},
+            extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
         )
         message = response.choices[0].message
         messages.append(
@@ -683,9 +503,10 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True):
     )
 
 
-async def _generate_reply_stream(user_input: str):
+async def _generate_reply_stream(user_input: str, model_key: str = DEFAULT_MODEL_KEY):
     """Yield event dicts; the caller serializes them for the wire."""
-    log.info("Chat request: %d chars", len(user_input))
+    log.info("Chat request: %d chars (model=%s)", len(user_input), model_key)
+    client, model_name, context_length = _model_choice(model_key)
     persona = _load_persona()
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -703,12 +524,12 @@ async def _generate_reply_stream(user_input: str):
         tool_call_chunks = {}
         round_content = ""
         round_thinking = ""
-        stream = await openai_client.chat.completions.create(
-            model=MODEL,
+        stream = await client.chat.completions.create(
+            model=model_name,
             messages=messages,
             tools=TOOL_SCHEMAS,
             stream=True,
-            extra_body={"options": {"num_ctx": 262144}, "keep_alive": -1},
+            extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
         )
         async for chunk in stream:
             delta = chunk.choices[0].delta
@@ -796,115 +617,6 @@ async def _generate_reply_stream(user_input: str):
         }
     )
     yield {"type": "done", "turn": turn}
-
-
-class _Generation:
-    """
-    A single in-flight reply, decoupled from the HTTP request that started it.
-
-    Generation runs as a background task writing events into a buffer, so closing or
-    reloading the page doesn't cancel it — the turn still completes and is saved. A client
-    that (re)connects replays the buffer and then follows live.
-    """
-
-    def __init__(self, user_input):
-        self.user_input = user_input
-        self.events = []
-        self.done = False
-        self.task = None
-        self._waiters = []
-
-    def emit(self, event):
-        self.events.append(event)
-        for waiter in self._waiters:
-            if not waiter.done():
-                waiter.set_result(None)
-        self._waiters.clear()
-
-    def finish(self):
-        self.done = True
-        self.emit({"type": "_eof"})
-
-    async def wait_for_event(self, seen):
-        """Block until there are events past index `seen`, or generation is done."""
-        if seen < len(self.events) or self.done:
-            return
-        waiter = asyncio.get_running_loop().create_future()
-        self._waiters.append(waiter)
-        await waiter
-
-    async def run(self):
-        try:
-            async for event in _generate_reply_stream(self.user_input):
-                self.emit(event)
-        except asyncio.CancelledError:
-            log.warning("Generation cancelled")
-            self.emit({"type": "error", "message": "Generation cancelled"})
-            raise
-        except Exception as e:
-            log.exception("Generation failed")
-            self.emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
-        finally:
-            self.finish()
-
-
-# At most one generation at a time — the agent is single-user and each turn depends on the
-# history the previous one wrote.
-_current_generation = None
-
-
-async def _replay(generation):
-    """Stream a generation's events to one client, from the beginning, then live."""
-    seen = 0
-    while True:
-        await generation.wait_for_event(seen)
-        while seen < len(generation.events):
-            event = generation.events[seen]
-            seen += 1
-            if event.get("type") == "_eof":
-                return
-            yield json.dumps(event) + "\n"
-        if generation.done and seen >= len(generation.events):
-            return
-
-
-@router.post("/chat")
-async def chat(user_input: str = Body(embed=True)):
-    global _current_generation
-    if _current_generation and not _current_generation.done:
-        log.info("Chat request arrived while a generation is in flight — attaching to it")
-        return StreamingResponse(
-            _replay(_current_generation), media_type="application/x-ndjson"
-        )
-    generation = _Generation(user_input)
-    _current_generation = generation
-    # A bare task already outlives the request that started it: the disconnect cancels
-    # the StreamingResponse, not this task. (Wrapping it in shield() was a bug —
-    # create_task() needs a coroutine and shield() returns a Future.)
-    generation.task = asyncio.create_task(generation.run())
-    return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
-
-
-@router.get("/chat/active")
-async def chat_active():
-    """
-    Report whether a reply is still being generated, so a freshly loaded page can
-    reattach to it instead of missing the rest of the response.
-    """
-    generation = _current_generation
-    if not generation or generation.done:
-        return {"active": False}
-    return {"active": True}
-
-
-@router.get("/chat/attach")
-async def chat_attach():
-    """Reattach to the in-flight generation, replaying everything emitted so far."""
-    generation = _current_generation
-    if not generation or generation.done:
-        return {"active": False}
-    log.info("Client reattached to in-flight generation")
-    return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
 
 
 @router.post("/job-trigger")
