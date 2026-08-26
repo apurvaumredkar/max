@@ -24,7 +24,99 @@ document.addEventListener('DOMContentLoaded', () => {
     const inputField = document.querySelector('.chat-input-bar input');
     const messagesEl = document.querySelector('.messages');
 
-    function renderMarkdown(text) {
+    const MODEL_STORAGE_KEY = 'max-model';
+
+    // --- Model picker (custom dropdown, so the popup can be rounded/sized to fit) ---
+
+    const modelPicker = document.querySelector('.model-picker');
+    const modelPickerButton = modelPicker.querySelector('.model-picker-button');
+    const modelPickerLabel = modelPicker.querySelector('.model-picker-label');
+    const modelPickerList = modelPicker.querySelector('.model-picker-list');
+    let selectedModelKey = null;
+    let modelOptions = [];
+
+    function renderModelOptions() {
+        modelPickerList.replaceChildren();
+        modelOptions.forEach(({ key, label }) => {
+            const optionEl = document.createElement('li');
+            optionEl.className = 'model-picker-option' + (key === selectedModelKey ? ' selected' : '');
+            optionEl.setAttribute('role', 'option');
+            optionEl.setAttribute('aria-selected', String(key === selectedModelKey));
+            optionEl.textContent = label;
+            optionEl.addEventListener('click', () => selectModel(key));
+            modelPickerList.appendChild(optionEl);
+        });
+    }
+
+    function selectModel(key) {
+        selectedModelKey = key;
+        const selected = modelOptions.find((o) => o.key === key);
+        modelPickerLabel.textContent = selected ? selected.label : '';
+        localStorage.setItem(MODEL_STORAGE_KEY, key);
+        renderModelOptions();
+        closeModelPicker();
+        loadContextUsage();
+    }
+
+    function openModelPicker() {
+        modelPickerList.hidden = false;
+        modelPickerButton.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeModelPicker() {
+        modelPickerList.hidden = true;
+        modelPickerButton.setAttribute('aria-expanded', 'false');
+    }
+
+    modelPickerButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (modelPickerList.hidden) openModelPicker();
+        else closeModelPicker();
+    });
+
+    document.addEventListener('click', closeModelPicker);
+
+    async function loadModelOptions() {
+        try {
+            const response = await fetch('/max/models');
+            const { default: defaultKey, options } = await response.json();
+            modelOptions = options;
+            const saved = localStorage.getItem(MODEL_STORAGE_KEY);
+            selectedModelKey = options.some((o) => o.key === saved) ? saved : defaultKey;
+            const selected = modelOptions.find((o) => o.key === selectedModelKey);
+            modelPickerLabel.textContent = selected ? selected.label : '';
+            renderModelOptions();
+            loadContextUsage();
+        } catch (error) {
+            console.error('Error loading model options:', error);
+        }
+    }
+
+    loadModelOptions();
+
+    // --- Context usage bar ---
+
+    const contextUsageFill = document.querySelector('.context-usage-fill');
+    const contextUsageLabel = document.querySelector('.context-usage-label');
+
+    async function loadContextUsage() {
+        if (!selectedModelKey) return;
+        try {
+            const response = await fetch(`/max/context-usage?model=${encodeURIComponent(selectedModelKey)}`);
+            const { percent_remaining, used_tokens, context_length } = await response.json();
+            contextUsageFill.style.width = `${percent_remaining}%`;
+            contextUsageFill.classList.toggle('warn', percent_remaining <= 50 && percent_remaining > 20);
+            contextUsageFill.classList.toggle('critical', percent_remaining <= 20);
+            contextUsageLabel.textContent = `${percent_remaining}% context remaining`;
+            contextUsageLabel.title = `${used_tokens.toLocaleString()} / ${context_length.toLocaleString()} tokens (estimated)`;
+        } catch (error) {
+            console.error('Error loading context usage:', error);
+        }
+    }
+
+    setInterval(loadContextUsage, 20000);
+
+    function renderInlineMarkdown(text) {
         const escaped = text
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
@@ -32,8 +124,38 @@ document.addEventListener('DOMContentLoaded', () => {
         return escaped
             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.+?)\*/g, '<em>$1</em>')
-            .replace(/`(.+?)`/g, '<code>$1</code>')
-            .replace(/\n/g, '<br>');
+            .replace(/`(.+?)`/g, '<code>$1</code>');
+    }
+
+    function renderMarkdown(text) {
+        return renderInlineMarkdown(text).replace(/\n/g, '<br>');
+    }
+
+    // Block-level renderer for the Editor tab's Preview — headers and lists on top of
+    // renderMarkdown's inline formatting, since context/*.md files use both.
+    function renderMarkdownDocument(text) {
+        let html = '';
+        let inList = false;
+        const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+        text.split('\n').forEach((line) => {
+            const headerMatch = line.match(/^(#{1,4})\s+(.*)/);
+            const listMatch = line.match(/^[-*]\s+(.*)/);
+            if (headerMatch) {
+                closeList();
+                const level = headerMatch[1].length;
+                html += `<h${level}>${renderInlineMarkdown(headerMatch[2])}</h${level}>`;
+            } else if (listMatch) {
+                if (!inList) { html += '<ul>'; inList = true; }
+                html += `<li>${renderInlineMarkdown(listMatch[1])}</li>`;
+            } else if (line.trim() === '') {
+                closeList();
+            } else {
+                closeList();
+                html += `<p>${renderInlineMarkdown(line)}</p>`;
+            }
+        });
+        closeList();
+        return html;
     }
 
     function formatTimestamp(date) {
@@ -197,6 +319,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function sendMessage() {
         const message = inputField.value.trim();
         if (!message) return;
+        activateTab('chat');
         addMessage('You', message);
         inputField.value = '';
 
@@ -205,7 +328,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/max/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ user_input: message })
+                body: JSON.stringify({ user_input: message, model: selectedModelKey })
             });
             await consumeStream(response, messageEl);
         } catch (error) {
@@ -246,6 +369,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         collapseReasoning(messageEl);
                         messageEl.querySelector('.timestamp').textContent = event.turn.timestamp;
                         if (event.turn.id) messageEl.dataset.turnId = event.turn.id;
+                        loadContextUsage();
                     } else if (event.type === 'error') {
                         console.error('Generation error:', event.message);
                         messageEl.querySelector('.content').textContent =
@@ -643,6 +767,183 @@ document.addEventListener('DOMContentLoaded', () => {
     followToggle.addEventListener('change', () => {
         if (followToggle.checked) scrollLogsToBottom();
     });
+
+    // --- Context files (list on the left; editing happens in the chat container's editor pane) ---
+
+    const contextFileList = document.querySelector('.context-file-list');
+    const editorEmpty = document.querySelector('.editor-empty');
+    const editorContent = document.querySelector('.editor-content');
+    const editorFilename = document.querySelector('.editor-filename');
+    const editorTokens = document.querySelector('.editor-tokens');
+    const editorFilenameInput = document.querySelector('.editor-filename-input');
+    const editorTextarea = document.querySelector('.editor-textarea');
+    const editorPreview = document.querySelector('.editor-preview');
+    const editorError = document.querySelector('.editor-error');
+    const editorSave = document.querySelector('.editor-save');
+    const editorSubtabs = document.querySelectorAll('.editor-subtab');
+    const contextConfirmOverlay = document.querySelector('.context-confirm-overlay');
+    const contextConfirmFilename = document.querySelector('.context-confirm-filename');
+    let contextEditingFilename = null;
+    let contextOriginalContent = '';
+    let isCreatingNewFile = false;
+
+    async function loadContextFiles() {
+        try {
+            const response = await fetch('/max/context-files');
+            const { files } = await response.json();
+            contextFileList.replaceChildren();
+            if (!files || files.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'context-empty';
+                empty.textContent = 'No .md files in context/';
+                contextFileList.appendChild(empty);
+                return;
+            }
+            files.forEach((filename) => {
+                const fileEl = document.createElement('div');
+                fileEl.className = 'context-file';
+                fileEl.innerHTML = '<span class="context-file-name"></span>';
+                fileEl.querySelector('.context-file-name').textContent = filename;
+                fileEl.addEventListener('click', () => openContextEditor(filename));
+                contextFileList.appendChild(fileEl);
+            });
+        } catch (error) {
+            console.error('Error loading context files:', error);
+        }
+    }
+
+    function setEditorSubtab(name) {
+        editorSubtabs.forEach((btn) => btn.classList.toggle('active', btn.dataset.subtab === name));
+        editorTextarea.hidden = name !== 'markdown';
+        editorPreview.hidden = name !== 'preview';
+        if (name === 'preview') editorPreview.innerHTML = renderMarkdownDocument(editorTextarea.value);
+    }
+
+    editorSubtabs.forEach((btn) => btn.addEventListener('click', () => setEditorSubtab(btn.dataset.subtab)));
+
+    function updateSaveVisibility() {
+        editorSave.hidden = isCreatingNewFile
+            ? editorFilenameInput.value.trim() === ''
+            : editorTextarea.value === contextOriginalContent;
+    }
+
+    function estimateTokens(text) {
+        return Math.max(1, Math.round((text || '').length / 4));
+    }
+
+    function formatTokenCount(count) {
+        return (count >= 1000 ? `${(count / 1000).toFixed(1)}k` : String(count)) + ' tokens';
+    }
+
+    function updateEditorTokens() {
+        editorTokens.textContent = formatTokenCount(estimateTokens(editorTextarea.value));
+    }
+
+    editorTextarea.addEventListener('input', () => {
+        updateSaveVisibility();
+        updateEditorTokens();
+    });
+    editorFilenameInput.addEventListener('input', updateSaveVisibility);
+
+    async function openContextEditor(filename) {
+        try {
+            const response = await fetch(`/max/context-files/${encodeURIComponent(filename)}`);
+            const result = await response.json();
+            if (!result.ok) {
+                console.error('Failed to load context file:', result.error);
+                return;
+            }
+            isCreatingNewFile = false;
+            contextEditingFilename = filename;
+            contextOriginalContent = result.content;
+            editorFilename.textContent = filename;
+            editorFilename.hidden = false;
+            editorFilenameInput.hidden = true;
+            editorTextarea.value = result.content;
+            editorTokens.textContent = formatTokenCount(result.tokens);
+            editorError.textContent = '';
+            editorSave.hidden = true;
+            editorEmpty.hidden = true;
+            editorContent.hidden = false;
+            setEditorSubtab('preview');
+            activateTab('editor');
+        } catch (error) {
+            console.error('Error opening context file:', error);
+        }
+    }
+
+    function openNewContextFile() {
+        isCreatingNewFile = true;
+        contextEditingFilename = null;
+        contextOriginalContent = '';
+        editorFilename.hidden = true;
+        editorFilenameInput.hidden = false;
+        editorFilenameInput.value = '';
+        editorTextarea.value = '';
+        updateEditorTokens();
+        editorError.textContent = '';
+        editorSave.hidden = true;
+        editorEmpty.hidden = true;
+        editorContent.hidden = false;
+        setEditorSubtab('markdown');
+        activateTab('editor');
+        editorFilenameInput.focus();
+    }
+
+    document.querySelector('.context-file-add').addEventListener('click', openNewContextFile);
+
+    editorSave.addEventListener('click', () => {
+        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : contextEditingFilename;
+        if (!filename) return;
+        if (isCreatingNewFile && !filename.endsWith('.md')) {
+            editorError.textContent = 'Filename must end in .md';
+            return;
+        }
+        contextConfirmFilename.textContent = filename;
+        contextConfirmOverlay.hidden = false;
+    });
+
+    document.querySelector('.context-confirm-cancel').addEventListener('click', () => {
+        contextConfirmOverlay.hidden = true;
+    });
+
+    document.querySelector('.context-confirm-ok').addEventListener('click', async () => {
+        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : contextEditingFilename;
+        const content = editorTextarea.value;
+        const saveButton = document.querySelector('.context-confirm-ok');
+        saveButton.disabled = true;
+        try {
+            const result = await fetch(`/max/context-files/${encodeURIComponent(filename)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then((r) => r.json());
+            if (result.ok) {
+                if (isCreatingNewFile) {
+                    isCreatingNewFile = false;
+                    contextEditingFilename = filename;
+                    editorFilename.textContent = filename;
+                    editorFilename.hidden = false;
+                    editorFilenameInput.hidden = true;
+                    loadContextFiles();
+                }
+                contextOriginalContent = content;
+                editorSave.hidden = true;
+                contextConfirmOverlay.hidden = true;
+            } else {
+                editorError.textContent = result.error || 'Save failed';
+                contextConfirmOverlay.hidden = true;
+            }
+        } catch (error) {
+            editorError.textContent = 'Save failed';
+            contextConfirmOverlay.hidden = true;
+            console.error('Error saving context file:', error);
+        } finally {
+            saveButton.disabled = false;
+        }
+    });
+
+    loadContextFiles();
 
     // --- Tabs ---
 

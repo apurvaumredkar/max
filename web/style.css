@@ -14,15 +14,35 @@ body {
     overflow: hidden;
     font-size: 17px;
     font-family: 'Open Sans', sans-serif;
+    display: flex;
+    flex-direction: column;
+}
+
+body > .app-layout {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
 }
 
 .container,
 .jobs-container,
 .messages,
 .scheduled-jobs,
-.cron-jobs {
+.cron-jobs,
+.context-file-list,
+.editor-textarea,
+.editor-preview {
     scrollbar-width: thin;
     scrollbar-color: #404040 transparent;
+}
+
+.app-layout {
+    display: flex;
+    align-items: flex-start;
+    gap: 20px;
+    height: 100%;
+    width: 100%;
+    box-sizing: border-box;
 }
 
 /* Scheduled and Cron sit side by side, each scrolling independently. */
@@ -66,7 +86,10 @@ body {
 .jobs-container::-webkit-scrollbar,
 .messages::-webkit-scrollbar,
 .scheduled-jobs::-webkit-scrollbar,
-.cron-jobs::-webkit-scrollbar {
+.cron-jobs::-webkit-scrollbar,
+.context-file-list::-webkit-scrollbar,
+.editor-textarea::-webkit-scrollbar,
+.editor-preview::-webkit-scrollbar {
     width: 8px;
 }
 
@@ -74,7 +97,10 @@ body {
 .jobs-container::-webkit-scrollbar-track,
 .messages::-webkit-scrollbar-track,
 .scheduled-jobs::-webkit-scrollbar-track,
-.cron-jobs::-webkit-scrollbar-track {
+.cron-jobs::-webkit-scrollbar-track,
+.context-file-list::-webkit-scrollbar-track,
+.editor-textarea::-webkit-scrollbar-track,
+.editor-preview::-webkit-scrollbar-track {
     background: transparent;
 }
 
@@ -82,7 +108,10 @@ body {
 .jobs-container::-webkit-scrollbar-thumb,
 .messages::-webkit-scrollbar-thumb,
 .scheduled-jobs::-webkit-scrollbar-thumb,
-.cron-jobs::-webkit-scrollbar-thumb {
+.cron-jobs::-webkit-scrollbar-thumb,
+.context-file-list::-webkit-scrollbar-thumb,
+.editor-textarea::-webkit-scrollbar-thumb,
+.editor-preview::-webkit-scrollbar-thumb {
     background-color: #404040;
     border-radius: 4px;
 }
@@ -91,42 +120,63 @@ body {
 .jobs-container::-webkit-scrollbar-thumb:hover,
 .messages::-webkit-scrollbar-thumb:hover,
 .scheduled-jobs::-webkit-scrollbar-thumb:hover,
-.cron-jobs::-webkit-scrollbar-thumb:hover {
+.cron-jobs::-webkit-scrollbar-thumb:hover,
+.context-file-list::-webkit-scrollbar-thumb:hover,
+.editor-textarea::-webkit-scrollbar-thumb:hover,
+.editor-preview::-webkit-scrollbar-thumb:hover {
     background-color: #555555;
 }
 
 pre {
-    margin: 0 0 20px 0;
+    /* Small logo mark in the corner, not a reserved top bar — taken out of flow so
+       .app-layout can use the full body height. */
+    position: fixed;
+    top: 14px;
+    left: 26px;
+    margin: 0;
+    font-size: 9px;
+    line-height: 1;
     white-space: pre-wrap;
     word-wrap: break-word;
+    pointer-events: none;
+    z-index: 5;
+}
+
+.chat-column {
+    /* Middle column: takes whatever width is left between the context panel and sidebar. */
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 0;
 }
 
 .container {
-    width: 40%;
-    height: calc(100vh - 180px);
-    border-radius: 50px;
+    border-radius: 24px;
     background-color: #1a1a1a;
     padding: 20px;
     box-sizing: border-box;
-    /* hidden, not auto: .messages is the only scrolling region, so the tab bar and the
-       chat input bar stay put instead of scrolling out of view with the transcript. */
+    /* hidden, not auto: .messages is the only scrolling region, so the tab bar stays
+       put instead of scrolling out of view with the transcript. */
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    flex: 1 1 auto;
     min-height: 0;
 }
 
 .sidebar {
-    position: fixed;
-    top: 20px;
-    right: 20px;
+    flex: 0 0 auto;
+    height: 100%;
     /* No shared width — the cards are sized independently below and right-aligned
        against this column, so one can be wide without dragging the other along. */
-    max-height: calc(100vh - 40px);
     display: flex;
     flex-direction: column;
     align-items: flex-end;
     gap: 20px;
+    overflow-y: auto;
 }
 
 .jobs-container {
@@ -143,6 +193,365 @@ pre {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+}
+
+.context-panel {
+    flex: 0 0 auto;
+    width: 320px;
+    /* Cleared below the fixed ascii-art logo; the other columns keep the full height. */
+    margin-top: 90px;
+    height: calc(100% - 90px);
+    border-radius: 24px;
+    background-color: #1a1a1a;
+    padding: 24px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.context-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+
+.context-header h2 {
+    margin: 0 0 16px 0;
+    font-size: 18px;
+}
+
+.context-file-add {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 15px;
+    line-height: 1;
+    width: 24px;
+    height: 24px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-bottom: 16px;
+}
+
+.context-file-add:hover {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.context-file-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.context-file {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background-color: #2a2a2a;
+    border-radius: 10px;
+    padding: 9px 11px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.context-file:hover {
+    background-color: #333333;
+}
+
+.context-file-name {
+    overflow-wrap: anywhere;
+}
+
+.context-file-edit {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 7px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-left: 8px;
+}
+
+.context-file-edit:hover {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.context-empty {
+    color: #666666;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+/* --- Editor tab (context file editing, lives in the chat container) --- */
+
+.editor-empty {
+    color: #666666;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.editor-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.editor-content[hidden] {
+    display: none;
+}
+
+.editor-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+}
+
+.editor-filename {
+    font-weight: 600;
+    font-size: 14px;
+    overflow-wrap: anywhere;
+}
+
+.editor-tokens {
+    color: #888888;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.editor-filename-input {
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 8px;
+    color: #ffffff;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 13px;
+    padding: 5px 9px;
+    outline: none;
+    min-width: 160px;
+}
+
+.editor-filename-input:focus {
+    border-color: #666666;
+}
+
+.editor-filename-input[hidden] {
+    display: none;
+}
+
+.editor-subtabs {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.editor-subtab {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 999px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 5px 14px;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    outline: none;
+}
+
+.editor-subtab:hover:not(.active) {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.editor-subtab.active {
+    background-color: #ffffff;
+    border-color: #ffffff;
+    color: #000000;
+}
+
+.editor-error {
+    color: #ff6b6b;
+    font-size: 11px;
+    line-height: 1.3;
+}
+
+.editor-save {
+    background-color: #ffffff;
+    border: 1px solid #ffffff;
+    border-radius: 50px;
+    color: #000000;
+    font-weight: 600;
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.editor-save:hover {
+    background-color: #e0e0e0;
+}
+
+.editor-save:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.editor-textarea,
+.editor-preview {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.editor-textarea[hidden],
+.editor-preview[hidden] {
+    display: none;
+}
+
+.editor-textarea {
+    resize: none;
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 12px;
+    color: #ffffff;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 12px;
+    outline: none;
+}
+
+.editor-textarea:focus {
+    border-color: #666666;
+}
+
+.editor-preview {
+    overflow-y: auto;
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 12px;
+    padding: 14px 18px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #dcddde;
+    scrollbar-width: thin;
+    scrollbar-color: #404040 transparent;
+}
+
+.editor-preview h1,
+.editor-preview h2,
+.editor-preview h3,
+.editor-preview h4 {
+    margin: 16px 0 8px 0;
+    color: #ffffff;
+}
+
+.editor-preview h1:first-child,
+.editor-preview h2:first-child,
+.editor-preview h3:first-child,
+.editor-preview h4:first-child {
+    margin-top: 0;
+}
+
+.editor-preview p {
+    margin: 0 0 10px 0;
+}
+
+.editor-preview ul {
+    margin: 0 0 10px 0;
+    padding-left: 22px;
+}
+
+.editor-preview li {
+    margin-bottom: 4px;
+}
+
+.editor-preview code {
+    background-color: #1e1e1e;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+.context-confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background-color: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+}
+
+.context-confirm-overlay[hidden] {
+    display: none;
+}
+
+.context-confirm-dialog {
+    background-color: #2a2a2a;
+    border-radius: 16px;
+    padding: 20px 24px;
+    max-width: 320px;
+    box-sizing: border-box;
+}
+
+.context-confirm-dialog p {
+    margin: 0 0 16px 0;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.context-confirm-filename {
+    font-weight: 600;
+}
+
+.context-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.context-confirm-cancel,
+.context-confirm-ok {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 50px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 16px;
+    cursor: pointer;
+}
+
+.context-confirm-ok {
+    background-color: #ffffff;
+    border-color: #ffffff;
+    color: #000000;
+    font-weight: 600;
+}
+
+.context-confirm-cancel:hover {
+    color: #ffffff;
+    border-color: #555555;
 }
 
 .spotify-container {
@@ -328,7 +737,6 @@ pre {
 }
 
 .chat-input-bar {
-    margin-top: auto;
     padding: 12px 16px;
     background-color: #2a2a2a;
     border: 1px solid #404040;
@@ -351,6 +759,129 @@ pre {
 
 .chat-input-bar input::placeholder {
     color: #666666;
+}
+
+.context-usage-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 4px;
+    flex-shrink: 0;
+}
+
+.context-usage-track {
+    flex: 1 1 auto;
+    height: 4px;
+    background-color: #2a2a2a;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.context-usage-fill {
+    height: 100%;
+    width: 100%;
+    background-color: #1db954;
+    border-radius: 999px;
+    transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+.context-usage-fill.warn {
+    background-color: #ffc107;
+}
+
+.context-usage-fill.critical {
+    background-color: #ff6b6b;
+}
+
+.context-usage-label {
+    flex-shrink: 0;
+    color: #888888;
+    font-size: 11px;
+}
+
+.model-picker {
+    position: relative;
+    flex-shrink: 0;
+}
+
+.model-picker-button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background-color: #1e1e1e;
+    color: #cccccc;
+    border: 1px solid #404040;
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.model-picker-button:hover {
+    border-color: #555555;
+}
+
+.model-picker-button[aria-expanded="true"] {
+    border-color: #666666;
+    color: #ffffff;
+}
+
+.model-picker-chevron {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 0.15s;
+}
+
+.model-picker-button[aria-expanded="true"] .model-picker-chevron {
+    transform: rotate(180deg);
+}
+
+.model-picker-list {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    right: 0;
+    margin: 0;
+    padding: 6px;
+    list-style: none;
+    width: max-content;
+    max-width: 260px;
+    background-color: #2a2a2a;
+    border: 1px solid #404040;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+}
+
+.model-picker-list[hidden] {
+    display: none;
+}
+
+.model-picker-option {
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #cccccc;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.model-picker-option:hover {
+    background-color: #383838;
+    color: #ffffff;
+}
+
+.model-picker-option.selected {
+    background-color: #0084ff;
+    color: #ffffff;
 }
 
 .send-button {
@@ -491,7 +1022,6 @@ pre {
 .tab-bar {
     display: flex;
     gap: 8px;
-    margin-bottom: 16px;
     flex-shrink: 0;
 }
 
