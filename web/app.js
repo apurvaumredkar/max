@@ -1057,21 +1057,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- System monitor ---
 
-    const sysmonStatus = document.querySelector('.sysmon-status');
+    const sysmonOllamaHome = document.querySelector('.sysmon-ollama-home');
+    const sysmonOllamaWork = document.querySelector('.sysmon-ollama-work');
     const sysmonRamValue = document.querySelector('.sysmon-ram-value');
     const sysmonRamFill = document.querySelector('.sysmon-ram-fill');
+
+    function setOllamaStatus(el, reachable) {
+        el.dataset.state = reachable ? 'up' : 'down';
+        el.textContent = reachable ? 'active' : 'unreachable';
+    }
 
     async function loadSystemStatus() {
         try {
             const status = await fetch('/max/system-status').then((r) => r.json());
-            sysmonStatus.dataset.state = status.ollama_reachable ? 'up' : 'down';
-            sysmonStatus.textContent = status.ollama_reachable ? 'active' : 'unreachable';
+            setOllamaStatus(sysmonOllamaHome, status.ollama.home);
+            setOllamaStatus(sysmonOllamaWork, status.ollama.work);
             const ram = status.ram;
             sysmonRamValue.textContent = `${ram.used_mb} / ${ram.total_mb} MB (${Math.round(ram.percent)}%)`;
             sysmonRamFill.style.width = `${ram.percent}%`;
         } catch (error) {
-            sysmonStatus.dataset.state = 'down';
-            sysmonStatus.textContent = 'unreachable';
+            setOllamaStatus(sysmonOllamaHome, false);
+            setOllamaStatus(sysmonOllamaWork, false);
             console.error('Error loading system status:', error);
         }
     }

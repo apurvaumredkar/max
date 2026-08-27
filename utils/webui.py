@@ -379,17 +379,14 @@ async def models_list():
 # --- System monitor ---
 
 
-def _tailscale_ollama_reachable():
-    """Hit the Tailscale Ollama host's native /api/tags with a short timeout — same check
+def _tailscale_ollama_reachable(provider_id):
+    """Hit one Tailscale Ollama host's native /api/tags with a short timeout — same check
     discover_ollama_models does, but without parsing the model list, just for a live status dot."""
-    host = (agent.TAILSCALE_OLLAMA_HOST_URL or "").removesuffix("/v1").rstrip("/")
+    provider = agent.TAILSCALE_OLLAMA_PROVIDERS[provider_id]
+    host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
     if not host:
         return False
-    headers = (
-        {"Authorization": f"Bearer {agent.TAILSCALE_OLLAMA_API_KEY}"}
-        if agent.TAILSCALE_OLLAMA_API_KEY
-        else {}
-    )
+    headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
     try:
         response = requests.get(f"{host}/api/tags", headers=headers, timeout=3)
         return response.ok
@@ -401,7 +398,10 @@ def _tailscale_ollama_reachable():
 async def system_status():
     vm = psutil.virtual_memory()
     return {
-        "ollama_reachable": _tailscale_ollama_reachable(),
+        "ollama": {
+            provider_id: _tailscale_ollama_reachable(provider_id)
+            for provider_id in agent.TAILSCALE_OLLAMA_PROVIDERS
+        },
         "ram": {
             "used_mb": round((vm.total - vm.available) / (1024 * 1024)),
             "total_mb": round(vm.total / (1024 * 1024)),

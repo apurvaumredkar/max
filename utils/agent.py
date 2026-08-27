@@ -36,8 +36,20 @@ STATIC_MODEL_OPTIONS = {
 }
 DEFAULT_MODEL_KEY = "openrouter-nemotron"
 
-TAILSCALE_OLLAMA_HOST_URL = os.getenv("TAILSCALE_OLLAMA_HOST_URL")
-TAILSCALE_OLLAMA_API_KEY = os.getenv("TAILSCALE_OLLAMA_API_KEY")
+# Two Tailscale-reachable Ollama hosts, keyed by provider id. "work" needs no API key —
+# it's plain `ollama serve` reached over Tailscale's own network-level security.
+TAILSCALE_OLLAMA_PROVIDERS = {
+    "home": {
+        "label": "Home",
+        "host_url": os.getenv("TAILSCALE_OLLAMA_HOME_HOST_URL"),
+        "api_key": os.getenv("TAILSCALE_OLLAMA_HOME_API_KEY"),
+    },
+    "work": {
+        "label": "Work (MacBook Pro)",
+        "host_url": os.getenv("TAILSCALE_OLLAMA_WORK_HOST_URL"),
+        "api_key": os.getenv("TAILSCALE_OLLAMA_WORK_API_KEY"),
+    },
+}
 
 # Default when Ollama's /api/tags doesn't report a model's context length (some families omit it).
 _OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
@@ -45,36 +57,37 @@ _OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
 
 def discover_ollama_models():
     """
-    Query the Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
+    Query each Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
     otherwise used through) for every model currently pulled there, so the model picker always
-    reflects what's actually available instead of one hardcoded model name. Returns {} (logging
-    the failure) if the host is unreachable — the static options still work without it.
+    reflects what's actually available instead of a hardcoded model name. A provider that's
+    unreachable is logged and skipped — the static options and the other provider still work.
     """
-    host = (TAILSCALE_OLLAMA_HOST_URL or "").removesuffix("/v1").rstrip("/")
-    if not host:
-        return {}
-    headers = {"Authorization": f"Bearer {TAILSCALE_OLLAMA_API_KEY}"} if TAILSCALE_OLLAMA_API_KEY else {}
-    try:
-        response = requests.get(f"{host}/api/tags", headers=headers, timeout=5)
-        response.raise_for_status()
-        models = response.json().get("models", [])
-    except Exception as e:
-        log.error("Failed to list Ollama models from %s: %s", host, e)
-        return {}
-
     options = {}
-    for entry in models:
-        name = entry.get("model") or entry.get("name")
-        if not name:
+    for provider_id, provider in TAILSCALE_OLLAMA_PROVIDERS.items():
+        host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
+        if not host:
             continue
-        options[f"tailscale-ollama:{name}"] = {
-            "label": f"Tailscale Ollama · {name}",
-            "model": name,
-            "base_url": TAILSCALE_OLLAMA_HOST_URL,
-            "api_key": TAILSCALE_OLLAMA_API_KEY,
-            "context_length": entry.get("details", {}).get("context_length")
-            or _OLLAMA_DEFAULT_CONTEXT_LENGTH,
-        }
+        headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
+        try:
+            response = requests.get(f"{host}/api/tags", headers=headers, timeout=5)
+            response.raise_for_status()
+            models = response.json().get("models", [])
+        except Exception as e:
+            log.error("Failed to list Ollama models from %s (%s): %s", host, provider_id, e)
+            continue
+
+        for entry in models:
+            name = entry.get("model") or entry.get("name")
+            if not name:
+                continue
+            options[f"tailscale-ollama-{provider_id}:{name}"] = {
+                "label": f"Tailscale Ollama · {provider['label']} · {name}",
+                "model": name,
+                "base_url": provider["host_url"],
+                "api_key": provider["api_key"],
+                "context_length": entry.get("details", {}).get("context_length")
+                or _OLLAMA_DEFAULT_CONTEXT_LENGTH,
+            }
     return options
 
 

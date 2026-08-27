@@ -19,6 +19,7 @@ import argparse
 import base64
 import json
 import os
+import time
 import urllib.parse
 
 import requests
@@ -75,7 +76,16 @@ def exchange_code_for_token(code):
     return refresh_token
 
 
+# In-process cache for the access token — the web UI polls now-playing every 5s, and
+# re-running the refresh-token exchange (a round trip to Spotify's auth server) on every
+# poll was the actual source of the card's lag. Access tokens are valid ~1hr; refresh
+# a bit early to stay clear of the exact expiry edge.
+_token_cache = {"access_token": None, "expires_at": 0}
+
+
 def get_access_token():
+    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"]:
+        return _token_cache["access_token"]
     credentials = base64.b64encode(
         f"{os.getenv('SPOTIFY_CLIENT_ID')}:{os.getenv('SPOTIFY_CLIENT_SECRET')}".encode()
     ).decode()
@@ -88,7 +98,10 @@ def get_access_token():
         },
     )
     response.raise_for_status()
-    return response.json()["access_token"]
+    data = response.json()
+    _token_cache["access_token"] = data["access_token"]
+    _token_cache["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+    return _token_cache["access_token"]
 
 
 def _auth_headers():
