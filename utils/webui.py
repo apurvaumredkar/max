@@ -17,9 +17,9 @@ from datetime import datetime
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 
+from utils import agent
 from utils.agent import (
     DEFAULT_MODEL_KEY,
-    MODEL_OPTIONS,
     TOOL_SCHEMAS,
     _generate_reply_stream,
     _jobs_system_message,
@@ -28,6 +28,7 @@ from utils.agent import (
     _load_jobs,
     _load_persona,
     _save_jobs,
+    _skills_system_message,
     _sync_crontab,
 )
 from utils.logging_config import get_logger
@@ -253,6 +254,7 @@ async def delete_job(job_id: str):
 # --- Context files ---
 
 CONTEXT_DIR = "context"
+SKILLS_DIR = "context/skills"
 
 
 def _estimate_tokens(text):
@@ -260,29 +262,52 @@ def _estimate_tokens(text):
     return max(1, round(len(text or "") / 4))
 
 
-def _context_md_path(filename):
-    """Resolve a filename to a .md path inside CONTEXT_DIR, or None if unsafe/invalid."""
-    if not filename.endswith(".md") or "/" in filename or "\\" in filename or filename in (".", ".."):
+def _md_path_in(directory, filename):
+    """
+    Resolve a filename — possibly nested, e.g. "sub/dir/file.md" — to a path inside
+    `directory`, or None if unsafe/invalid.
+    """
+    if not filename.endswith(".md") or "\\" in filename:
         return None
-    path = os.path.join(CONTEXT_DIR, filename)
-    if os.path.dirname(path) != CONTEXT_DIR:
+    if any(part in ("", ".", "..") for part in filename.split("/")):
+        return None
+    path = os.path.normpath(os.path.join(directory, filename))
+    root = os.path.normpath(directory)
+    if path != root and not path.startswith(root + os.sep):
         return None
     return path
 
 
+def _list_md_files(directory, exclude_dirs=()):
+    """
+    Recursively list .md files under `directory` as '/'-joined paths relative to it.
+    Subdirectories named in `exclude_dirs` (direct children of `directory` only) are skipped
+    entirely — used to keep context/skills/ out of the general context-files listing, since it
+    has its own dedicated Playbooks panel.
+    """
+    if not os.path.isdir(directory):
+        return []
+    results = []
+    for root, dirs, files in os.walk(directory):
+        rel_root = os.path.relpath(root, directory)
+        if rel_root == ".":
+            dirs[:] = [d for d in dirs if d not in exclude_dirs]
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            rel_path = filename if rel_root == "." else os.path.join(rel_root, filename)
+            results.append(rel_path.replace(os.sep, "/"))
+    return sorted(results)
+
+
 @router.get("/context-files")
 async def list_context_files():
-    try:
-        names = sorted(f for f in os.listdir(CONTEXT_DIR) if f.endswith(".md"))
-    except OSError as e:
-        log.error("Failed to list context files: %s", e)
-        return {"files": []}
-    return {"files": names}
+    return {"files": _list_md_files(CONTEXT_DIR, exclude_dirs={"skills"})}
 
 
-@router.get("/context-files/{filename}")
+@router.get("/context-files/{filename:path}")
 async def get_context_file(filename: str):
-    path = _context_md_path(filename)
+    path = _md_path_in(CONTEXT_DIR, filename)
     if not path or not os.path.isfile(path):
         return {"ok": False, "error": "File not found"}
     with open(path, "r", encoding="utf-8") as f:
@@ -290,15 +315,47 @@ async def get_context_file(filename: str):
     return {"ok": True, "filename": filename, "content": content, "tokens": _estimate_tokens(content)}
 
 
-@router.put("/context-files/{filename}")
+@router.put("/context-files/{filename:path}")
 async def save_context_file(filename: str, payload: dict = Body(...)):
-    path = _context_md_path(filename)
+    path = _md_path_in(CONTEXT_DIR, filename)
     if not path:
         return {"ok": False, "error": "Invalid filename"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     content = payload.get("content", "")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     log.info("Context file saved via UI: %s", filename)
+    return {"ok": True}
+
+
+# --- Skill files (playbooks) ---
+
+
+@router.get("/skills-files")
+async def list_skill_files():
+    return {"files": _list_md_files(SKILLS_DIR)}
+
+
+@router.get("/skills-files/{filename:path}")
+async def get_skill_file(filename: str):
+    path = _md_path_in(SKILLS_DIR, filename)
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "error": "File not found"}
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return {"ok": True, "filename": filename, "content": content, "tokens": _estimate_tokens(content)}
+
+
+@router.put("/skills-files/{filename:path}")
+async def save_skill_file(filename: str, payload: dict = Body(...)):
+    path = _md_path_in(SKILLS_DIR, filename)
+    if not path:
+        return {"ok": False, "error": "Invalid filename"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    content = payload.get("content", "")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    log.info("Skill file saved via UI: %s", filename)
     return {"ok": True}
 
 
@@ -307,25 +364,27 @@ async def save_context_file(filename: str, payload: dict = Body(...)):
 
 @router.get("/models")
 async def models_list():
+    options = agent.refresh_model_options()
     return {
         "default": DEFAULT_MODEL_KEY,
         "options": [
             {"key": key, "label": opts["label"], "context_length": opts["context_length"]}
-            for key, opts in MODEL_OPTIONS.items()
+            for key, opts in options.items()
         ],
     }
 
 
 @router.get("/context-usage")
 async def context_usage(model: str = DEFAULT_MODEL_KEY):
-    key = model if model in MODEL_OPTIONS else DEFAULT_MODEL_KEY
-    context_length = MODEL_OPTIONS[key]["context_length"]
+    key = model if model in agent.MODEL_OPTIONS else DEFAULT_MODEL_KEY
+    context_length = agent.MODEL_OPTIONS[key]["context_length"]
     persona = _load_persona() or ""
     jobs_text = _jobs_system_message()["content"]
+    skills_text = _skills_system_message()["content"]
     history = _load_history()
     history_text = "".join(turn.get("content") or "" for turn in history)
     tool_schemas_text = json.dumps(TOOL_SCHEMAS)
-    used_tokens = _estimate_tokens(persona + jobs_text + history_text + tool_schemas_text)
+    used_tokens = _estimate_tokens(persona + jobs_text + skills_text + history_text + tool_schemas_text)
     return {
         "model": key,
         "context_length": context_length,

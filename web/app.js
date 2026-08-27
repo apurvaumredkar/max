@@ -633,7 +633,9 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch('/max/jobs');
             const jobs = await response.json();
-            renderJobs(document.querySelector('.scheduled-jobs'), jobs.scheduled, (job) => describeRunAt(job.run_at));
+            // "YYYY-MM-DD HH:MM" sorts correctly as a plain string — earliest first.
+            const scheduled = [...(jobs.scheduled || [])].sort((a, b) => a.run_at.localeCompare(b.run_at));
+            renderJobs(document.querySelector('.scheduled-jobs'), scheduled, (job) => describeRunAt(job.run_at));
             renderJobs(document.querySelector('.cron-jobs'), jobs.cron, (job) => describeSchedule(job.schedule));
         } catch (error) {
             console.error('Error loading jobs:', error);
@@ -768,9 +770,32 @@ document.addEventListener('DOMContentLoaded', () => {
         if (followToggle.checked) scrollLogsToBottom();
     });
 
-    // --- Context files (list on the left; editing happens in the chat container's editor pane) ---
+    // --- Markdown file panels (Context Files + Playbooks; editing happens in the chat
+    // container's editor pane, shared across both kinds since only one can be open at a time) ---
 
-    const contextFileList = document.querySelector('.context-file-list');
+    const FILE_KINDS = {
+        context: {
+            apiBase: '/max/context-files',
+            listEl: document.querySelector('.context-file-list'),
+            addButton: document.querySelector('.context-file-add'),
+            itemClass: 'context-file',
+            itemNameClass: 'context-file-name',
+            emptyClass: 'context-empty',
+            emptyText: 'No .md files in context/',
+            newPlaceholder: 'new-file.md'
+        },
+        skill: {
+            apiBase: '/max/skills-files',
+            listEl: document.querySelector('.skill-file-list'),
+            addButton: document.querySelector('.skill-file-add'),
+            itemClass: 'skill-file',
+            itemNameClass: 'skill-file-name',
+            emptyClass: 'skill-empty',
+            emptyText: 'No .md files in context/skills/',
+            newPlaceholder: 'new-skill.md'
+        }
+    };
+
     const editorEmpty = document.querySelector('.editor-empty');
     const editorContent = document.querySelector('.editor-content');
     const editorFilename = document.querySelector('.editor-filename');
@@ -783,32 +808,77 @@ document.addEventListener('DOMContentLoaded', () => {
     const editorSubtabs = document.querySelectorAll('.editor-subtab');
     const contextConfirmOverlay = document.querySelector('.context-confirm-overlay');
     const contextConfirmFilename = document.querySelector('.context-confirm-filename');
-    let contextEditingFilename = null;
-    let contextOriginalContent = '';
+    let editingKind = null;
+    let editingFilename = null;
+    let originalContent = '';
     let isCreatingNewFile = false;
 
-    async function loadContextFiles() {
+    // Turn a flat list of '/'-joined relative paths into a folder/file tree, so nested
+    // context/skill files (e.g. "github-projects/notes.md") render indented under a folder
+    // label instead of as one long path string.
+    function buildFileTree(paths) {
+        const root = { children: new Map() };
+        paths.forEach((filePath) => {
+            const parts = filePath.split('/');
+            let node = root;
+            parts.forEach((part, i) => {
+                const isFile = i === parts.length - 1;
+                if (!node.children.has(part)) {
+                    node.children.set(part, {
+                        name: part,
+                        isFile,
+                        children: new Map(),
+                        fullPath: parts.slice(0, i + 1).join('/')
+                    });
+                }
+                node = node.children.get(part);
+            });
+        });
+        return root;
+    }
+
+    function renderFileTreeNode(listEl, cfg, kind, node, depth) {
+        const children = [...node.children.values()].sort((a, b) => {
+            if (a.isFile !== b.isFile) return a.isFile ? 1 : -1;
+            return a.name.localeCompare(b.name);
+        });
+        children.forEach((child) => {
+            if (child.isFile) {
+                const fileEl = document.createElement('div');
+                fileEl.className = cfg.itemClass;
+                fileEl.style.marginLeft = `${depth * 16}px`;
+                fileEl.innerHTML = `<span class="${cfg.itemNameClass}"></span>`;
+                fileEl.querySelector(`.${cfg.itemNameClass}`).textContent = child.name;
+                fileEl.title = child.fullPath;
+                fileEl.addEventListener('click', () => openFileEditor(kind, child.fullPath));
+                listEl.appendChild(fileEl);
+            } else {
+                const folderEl = document.createElement('div');
+                folderEl.className = 'file-folder-label';
+                folderEl.style.marginLeft = `${depth * 16}px`;
+                folderEl.textContent = child.name;
+                listEl.appendChild(folderEl);
+                renderFileTreeNode(listEl, cfg, kind, child, depth + 1);
+            }
+        });
+    }
+
+    async function loadFileList(kind) {
+        const cfg = FILE_KINDS[kind];
         try {
-            const response = await fetch('/max/context-files');
+            const response = await fetch(cfg.apiBase);
             const { files } = await response.json();
-            contextFileList.replaceChildren();
+            cfg.listEl.replaceChildren();
             if (!files || files.length === 0) {
                 const empty = document.createElement('div');
-                empty.className = 'context-empty';
-                empty.textContent = 'No .md files in context/';
-                contextFileList.appendChild(empty);
+                empty.className = cfg.emptyClass;
+                empty.textContent = cfg.emptyText;
+                cfg.listEl.appendChild(empty);
                 return;
             }
-            files.forEach((filename) => {
-                const fileEl = document.createElement('div');
-                fileEl.className = 'context-file';
-                fileEl.innerHTML = '<span class="context-file-name"></span>';
-                fileEl.querySelector('.context-file-name').textContent = filename;
-                fileEl.addEventListener('click', () => openContextEditor(filename));
-                contextFileList.appendChild(fileEl);
-            });
+            renderFileTreeNode(cfg.listEl, cfg, kind, buildFileTree(files), 0);
         } catch (error) {
-            console.error('Error loading context files:', error);
+            console.error(`Error loading ${kind} files:`, error);
         }
     }
 
@@ -824,7 +894,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateSaveVisibility() {
         editorSave.hidden = isCreatingNewFile
             ? editorFilenameInput.value.trim() === ''
-            : editorTextarea.value === contextOriginalContent;
+            : editorTextarea.value === originalContent;
     }
 
     function estimateTokens(text) {
@@ -845,17 +915,26 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     editorFilenameInput.addEventListener('input', updateSaveVisibility);
 
-    async function openContextEditor(filename) {
+    // Encode each path segment but keep '/' literal, so nested filenames (e.g.
+    // "sub/dir/file.md") still route to FastAPI's {filename:path} param correctly —
+    // encodeURIComponent alone would turn '/' into '%2F' and break the match.
+    function encodeFilePath(filename) {
+        return filename.split('/').map(encodeURIComponent).join('/');
+    }
+
+    async function openFileEditor(kind, filename) {
+        const cfg = FILE_KINDS[kind];
         try {
-            const response = await fetch(`/max/context-files/${encodeURIComponent(filename)}`);
+            const response = await fetch(`${cfg.apiBase}/${encodeFilePath(filename)}`);
             const result = await response.json();
             if (!result.ok) {
-                console.error('Failed to load context file:', result.error);
+                console.error(`Failed to load ${kind} file:`, result.error);
                 return;
             }
             isCreatingNewFile = false;
-            contextEditingFilename = filename;
-            contextOriginalContent = result.content;
+            editingKind = kind;
+            editingFilename = filename;
+            originalContent = result.content;
             editorFilename.textContent = filename;
             editorFilename.hidden = false;
             editorFilenameInput.hidden = true;
@@ -868,16 +947,19 @@ document.addEventListener('DOMContentLoaded', () => {
             setEditorSubtab('preview');
             activateTab('editor');
         } catch (error) {
-            console.error('Error opening context file:', error);
+            console.error(`Error opening ${kind} file:`, error);
         }
     }
 
-    function openNewContextFile() {
+    function openNewFile(kind) {
+        const cfg = FILE_KINDS[kind];
         isCreatingNewFile = true;
-        contextEditingFilename = null;
-        contextOriginalContent = '';
+        editingKind = kind;
+        editingFilename = null;
+        originalContent = '';
         editorFilename.hidden = true;
         editorFilenameInput.hidden = false;
+        editorFilenameInput.placeholder = cfg.newPlaceholder;
         editorFilenameInput.value = '';
         editorTextarea.value = '';
         updateEditorTokens();
@@ -890,10 +972,12 @@ document.addEventListener('DOMContentLoaded', () => {
         editorFilenameInput.focus();
     }
 
-    document.querySelector('.context-file-add').addEventListener('click', openNewContextFile);
+    Object.entries(FILE_KINDS).forEach(([kind, cfg]) => {
+        cfg.addButton.addEventListener('click', () => openNewFile(kind));
+    });
 
     editorSave.addEventListener('click', () => {
-        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : contextEditingFilename;
+        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : editingFilename;
         if (!filename) return;
         if (isCreatingNewFile && !filename.endsWith('.md')) {
             editorError.textContent = 'Filename must end in .md';
@@ -908,12 +992,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.querySelector('.context-confirm-ok').addEventListener('click', async () => {
-        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : contextEditingFilename;
+        const filename = isCreatingNewFile ? editorFilenameInput.value.trim() : editingFilename;
         const content = editorTextarea.value;
+        const apiBase = FILE_KINDS[editingKind].apiBase;
         const saveButton = document.querySelector('.context-confirm-ok');
         saveButton.disabled = true;
         try {
-            const result = await fetch(`/max/context-files/${encodeURIComponent(filename)}`, {
+            const result = await fetch(`${apiBase}/${encodeFilePath(filename)}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ content })
@@ -921,13 +1006,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (result.ok) {
                 if (isCreatingNewFile) {
                     isCreatingNewFile = false;
-                    contextEditingFilename = filename;
+                    editingFilename = filename;
                     editorFilename.textContent = filename;
                     editorFilename.hidden = false;
                     editorFilenameInput.hidden = true;
-                    loadContextFiles();
+                    loadFileList(editingKind);
                 }
-                contextOriginalContent = content;
+                originalContent = content;
                 editorSave.hidden = true;
                 contextConfirmOverlay.hidden = true;
             } else {
@@ -937,13 +1022,21 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (error) {
             editorError.textContent = 'Save failed';
             contextConfirmOverlay.hidden = true;
-            console.error('Error saving context file:', error);
+            console.error(`Error saving ${editingKind} file:`, error);
         } finally {
             saveButton.disabled = false;
         }
     });
 
-    loadContextFiles();
+    loadFileList('context');
+    loadFileList('skill');
+
+    // Files also get created outside the editor (e.g. Max writing to context/ via
+    // _execute_bash), so poll rather than only refreshing after a UI-driven save.
+    setInterval(() => {
+        loadFileList('context');
+        loadFileList('skill');
+    }, 20000);
 
     // --- Tabs ---
 

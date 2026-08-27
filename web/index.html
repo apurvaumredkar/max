@@ -25,11 +25,20 @@
 <div class="app-layout">
 
 <div class="context-panel">
-    <div class="context-header">
-        <h2>Context Files</h2>
-        <button class="context-file-add" aria-label="New file" title="New file">+</button>
+    <div class="context-card">
+        <div class="context-header">
+            <h2>Context Files</h2>
+            <button class="context-file-add" aria-label="New file" title="New file">+</button>
+        </div>
+        <div class="context-file-list"></div>
     </div>
-    <div class="context-file-list"></div>
+    <div class="context-card">
+        <div class="context-header">
+            <h2>Playbooks</h2>
+            <button class="skill-file-add" aria-label="New playbook" title="New playbook">+</button>
+        </div>
+        <div class="skill-file-list"></div>
+    </div>
 </div>
 
 <div class="context-confirm-overlay" hidden>
@@ -66,7 +75,7 @@
         </div>
 
         <div class="tab-panel" data-panel="editor" hidden>
-            <div class="editor-empty">Select a file from Context Files to edit.</div>
+            <div class="editor-empty">Select a file from Context Files or Playbooks to edit.</div>
             <div class="editor-content" hidden>
                 <div class="editor-toolbar">
                     <span class="editor-filename"></span>

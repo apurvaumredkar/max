@@ -4,6 +4,7 @@ from openai import AsyncOpenAI
 import os
 import subprocess
 import shlex
+import requests
 from dotenv import load_dotenv
 from datetime import datetime
 import json
@@ -20,8 +21,10 @@ JOB_TRIGGER_URL = "http://localhost/max/job-trigger"
 
 # Selectable inference backends — the UI's model selector picks a key from here per request.
 # Each is an OpenAI-compatible endpoint; base_url/api_key come from secrets/.env so credentials
-# stay out of source.
-MODEL_OPTIONS = {
+# stay out of source. The Ollama host's own entries are discovered dynamically (see
+# discover_ollama_models below) rather than hardcoded, so newly pulled models show up without
+# a code change.
+STATIC_MODEL_OPTIONS = {
     "openrouter-nemotron": {
         "label": "OpenRouter · Nemotron 3 Ultra",
         "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -30,27 +33,67 @@ MODEL_OPTIONS = {
         # The :free tier's context window (the paid tier is capped at 512,288).
         "context_length": 1_000_000,
     },
-    "tailscale-ornith": {
-        "label": "Tailscale Ollama · Ornith 1.5 35B",
-        "model": "ornith-1.5:35b",
-        "base_url": os.getenv("TAILSCALE_OLLAMA_HOST_URL"),
-        "api_key": os.getenv("TAILSCALE_OLLAMA_API_KEY"),
-        "context_length": 262_144,
-    },
 }
 DEFAULT_MODEL_KEY = "openrouter-nemotron"
 
-_openai_clients = {
-    key: AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"])
-    for key, opts in MODEL_OPTIONS.items()
-}
+TAILSCALE_OLLAMA_HOST_URL = os.getenv("TAILSCALE_OLLAMA_HOST_URL")
+TAILSCALE_OLLAMA_API_KEY = os.getenv("TAILSCALE_OLLAMA_API_KEY")
+
+# Default when Ollama's /api/tags doesn't report a model's context length (some families omit it).
+_OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
+
+
+def discover_ollama_models():
+    """
+    Query the Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
+    otherwise used through) for every model currently pulled there, so the model picker always
+    reflects what's actually available instead of one hardcoded model name. Returns {} (logging
+    the failure) if the host is unreachable — the static options still work without it.
+    """
+    host = (TAILSCALE_OLLAMA_HOST_URL or "").removesuffix("/v1").rstrip("/")
+    if not host:
+        return {}
+    headers = {"Authorization": f"Bearer {TAILSCALE_OLLAMA_API_KEY}"} if TAILSCALE_OLLAMA_API_KEY else {}
+    try:
+        response = requests.get(f"{host}/api/tags", headers=headers, timeout=5)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+    except Exception as e:
+        log.error("Failed to list Ollama models from %s: %s", host, e)
+        return {}
+
+    options = {}
+    for entry in models:
+        name = entry.get("model") or entry.get("name")
+        if not name:
+            continue
+        options[f"tailscale-ollama:{name}"] = {
+            "label": f"Tailscale Ollama · {name}",
+            "model": name,
+            "base_url": TAILSCALE_OLLAMA_HOST_URL,
+            "api_key": TAILSCALE_OLLAMA_API_KEY,
+            "context_length": entry.get("details", {}).get("context_length")
+            or _OLLAMA_DEFAULT_CONTEXT_LENGTH,
+        }
+    return options
+
+
+MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models()}
+
+
+def refresh_model_options():
+    """Re-query the Ollama host so newly pulled/removed models show up without a restart."""
+    global MODEL_OPTIONS
+    MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models()}
+    return MODEL_OPTIONS
 
 
 def _model_choice(model_key):
-    """Resolve a UI model key to its client + model id + context window, falling back to the default."""
+    """Resolve a UI model key to a client + model id + context window, falling back to the default."""
     key = model_key if model_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
     opts = MODEL_OPTIONS[key]
-    return _openai_clients[key], opts["model"], opts["context_length"]
+    client = AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"])
+    return client, opts["model"], opts["context_length"]
 
 
 embed_client = Client(host="http://localhost:11434")
@@ -394,6 +437,77 @@ def _jobs_system_message():
     }
 
 
+SKILLS_DIR = "context/skills"
+
+
+def _parse_skill_frontmatter(content):
+    """Extract `name`/`description` from a skill file's leading YAML frontmatter, if present."""
+    if not content.startswith("---"):
+        return None, None
+    end = content.find("\n---", 3)
+    if end == -1:
+        return None, None
+    name = description = None
+    for line in content[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip().strip('"').strip("'")
+        if key == "name":
+            name = value
+        elif key == "description":
+            description = value
+    return name, description
+
+
+def _load_skills():
+    """List available playbooks (context/skills/*.md) with their name/description parsed
+    from frontmatter."""
+    skills = []
+    if not os.path.isdir(SKILLS_DIR):
+        return skills
+    for filename in sorted(os.listdir(SKILLS_DIR)):
+        if not filename.endswith(".md"):
+            continue
+        path = os.path.join(SKILLS_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            log.error("Failed to read skill file %s: %s", path, e)
+            continue
+        name, description = _parse_skill_frontmatter(content)
+        skills.append(
+            {"filename": filename, "name": name or filename[:-3], "description": description or ""}
+        )
+    return skills
+
+
+def _skills_system_message():
+    """
+    Render available playbooks as a system message — just their name/description, not their
+    full contents. Each entry is cheap (a couple lines); the full file is only worth reading
+    once a description actually matches what's being asked, via `_execute_bash`.
+    """
+    skills = _load_skills()
+    if not skills:
+        body = "There are currently no playbooks in context/skills/."
+    else:
+        lines = [f"- `{s['filename']}` — {s['name']}: {s['description']}" for s in skills]
+        body = "Available playbooks:\n" + "\n".join(lines)
+    return {
+        "role": "system",
+        "content": (
+            f"{body}\n\n"
+            "A playbook is a markdown file with step-by-step instructions for handling a "
+            "specific kind of task. If one's description matches what the user is asking for, "
+            "read it in full first with `_execute_bash` (e.g. `cat context/skills/<filename>`) "
+            "before acting on it — don't guess its contents from the name/description alone."
+        ),
+    }
+
+
 def sync_crontab_on_startup():
     """
     Bring the crontab in line with jobs.json at boot.
@@ -429,6 +543,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     messages = [
         {"role": "system", "content": persona},
         _jobs_system_message(),
+        _skills_system_message(),
         *context,
     ]
     if not save_user_turn:
@@ -514,6 +629,7 @@ async def _generate_reply_stream(user_input: str, model_key: str = DEFAULT_MODEL
     messages = [
         {"role": "system", "content": persona},
         _jobs_system_message(),
+        _skills_system_message(),
         *context,
     ]
     tool_calls_log = []

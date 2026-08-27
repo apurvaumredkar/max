@@ -30,6 +30,7 @@ body > .app-layout {
 .scheduled-jobs,
 .cron-jobs,
 .context-file-list,
+.skill-file-list,
 .editor-textarea,
 .editor-preview {
     scrollbar-width: thin;
@@ -88,6 +89,7 @@ body > .app-layout {
 .scheduled-jobs::-webkit-scrollbar,
 .cron-jobs::-webkit-scrollbar,
 .context-file-list::-webkit-scrollbar,
+.skill-file-list::-webkit-scrollbar,
 .editor-textarea::-webkit-scrollbar,
 .editor-preview::-webkit-scrollbar {
     width: 8px;
@@ -99,6 +101,7 @@ body > .app-layout {
 .scheduled-jobs::-webkit-scrollbar-track,
 .cron-jobs::-webkit-scrollbar-track,
 .context-file-list::-webkit-scrollbar-track,
+.skill-file-list::-webkit-scrollbar-track,
 .editor-textarea::-webkit-scrollbar-track,
 .editor-preview::-webkit-scrollbar-track {
     background: transparent;
@@ -110,6 +113,7 @@ body > .app-layout {
 .scheduled-jobs::-webkit-scrollbar-thumb,
 .cron-jobs::-webkit-scrollbar-thumb,
 .context-file-list::-webkit-scrollbar-thumb,
+.skill-file-list::-webkit-scrollbar-thumb,
 .editor-textarea::-webkit-scrollbar-thumb,
 .editor-preview::-webkit-scrollbar-thumb {
     background-color: #404040;
@@ -122,6 +126,7 @@ body > .app-layout {
 .scheduled-jobs::-webkit-scrollbar-thumb:hover,
 .cron-jobs::-webkit-scrollbar-thumb:hover,
 .context-file-list::-webkit-scrollbar-thumb:hover,
+.skill-file-list::-webkit-scrollbar-thumb:hover,
 .editor-textarea::-webkit-scrollbar-thumb:hover,
 .editor-preview::-webkit-scrollbar-thumb:hover {
     background-color: #555555;
@@ -201,6 +206,16 @@ pre {
     /* Cleared below the fixed ascii-art logo; the other columns keep the full height. */
     margin-top: 90px;
     height: calc(100% - 90px);
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    min-height: 0;
+}
+
+/* Context Files (top) and Playbooks (bottom) — same card shape, stacked and evenly split. */
+.context-card {
+    flex: 1 1 0;
+    min-height: 0;
     border-radius: 24px;
     background-color: #1a1a1a;
     padding: 24px;
@@ -222,7 +237,8 @@ pre {
     font-size: 18px;
 }
 
-.context-file-add {
+.context-file-add,
+.skill-file-add {
     background: none;
     border: 1px solid #404040;
     border-radius: 50px;
@@ -237,19 +253,22 @@ pre {
     margin-bottom: 16px;
 }
 
-.context-file-add:hover {
+.context-file-add:hover,
+.skill-file-add:hover {
     color: #ffffff;
     border-color: #555555;
 }
 
-.context-file-list {
+.context-file-list,
+.skill-file-list {
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     padding-right: 4px;
 }
 
-.context-file {
+.context-file,
+.skill-file {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -261,12 +280,43 @@ pre {
     cursor: pointer;
 }
 
-.context-file:hover {
+.context-file:hover,
+.skill-file:hover {
     background-color: #333333;
 }
 
-.context-file-name {
+.context-file-name,
+.skill-file-name {
     overflow-wrap: anywhere;
+}
+
+.file-folder-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #888888;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin: 10px 0 6px 0;
+    overflow-wrap: anywhere;
+}
+
+.file-folder-label::before {
+    content: "";
+    width: 10px;
+    height: 8px;
+    flex-shrink: 0;
+    background-color: #555555;
+    border-radius: 0 2px 2px 2px;
+    /* Tiny folder-tab notch on the top-left, drawn with a clip-path since a single div can't
+       have a separate-colored tab otherwise. */
+    clip-path: polygon(0 20%, 40% 20%, 55% 0, 100% 0, 100% 100%, 0 100%);
+}
+
+.file-folder-label:first-child {
+    margin-top: 0;
 }
 
 .context-file-edit {
@@ -288,7 +338,8 @@ pre {
     border-color: #555555;
 }
 
-.context-empty {
+.context-empty,
+.skill-empty {
     color: #666666;
     font-size: 13px;
     line-height: 1.5;
