@@ -34,15 +34,53 @@ document.addEventListener('DOMContentLoaded', () => {
     const modelPickerList = modelPicker.querySelector('.model-picker-list');
     let selectedModelKey = null;
     let modelOptions = [];
+    // null = showing the group list; a group name = drilled into that group's models.
+    let openGroup = null;
+
+    function groupModelOptions() {
+        const groups = new Map();
+        modelOptions.forEach((opt) => {
+            if (!groups.has(opt.group)) groups.set(opt.group, []);
+            groups.get(opt.group).push(opt);
+        });
+        return groups;
+    }
 
     function renderModelOptions() {
         modelPickerList.replaceChildren();
-        modelOptions.forEach(({ key, label }) => {
+        const groups = groupModelOptions();
+
+        if (openGroup === null || !groups.has(openGroup)) {
+            groups.forEach((opts, group) => {
+                const groupEl = document.createElement('li');
+                const hasSelection = opts.some((o) => o.key === selectedModelKey);
+                groupEl.className = 'model-picker-group' + (hasSelection ? ' active-group' : '');
+                groupEl.setAttribute('role', 'option');
+                groupEl.innerHTML = `<span>${group}</span><span class="model-picker-count">${opts.length}</span>`;
+                groupEl.addEventListener('click', () => {
+                    openGroup = group;
+                    renderModelOptions();
+                });
+                modelPickerList.appendChild(groupEl);
+            });
+            return;
+        }
+
+        const backEl = document.createElement('li');
+        backEl.className = 'model-picker-back';
+        backEl.textContent = '‹ ' + openGroup;
+        backEl.addEventListener('click', () => {
+            openGroup = null;
+            renderModelOptions();
+        });
+        modelPickerList.appendChild(backEl);
+
+        groups.get(openGroup).forEach(({ key, model_label }) => {
             const optionEl = document.createElement('li');
             optionEl.className = 'model-picker-option' + (key === selectedModelKey ? ' selected' : '');
             optionEl.setAttribute('role', 'option');
             optionEl.setAttribute('aria-selected', String(key === selectedModelKey));
-            optionEl.textContent = label;
+            optionEl.textContent = model_label;
             optionEl.addEventListener('click', () => selectModel(key));
             modelPickerList.appendChild(optionEl);
         });
@@ -59,6 +97,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function openModelPicker() {
+        const selected = modelOptions.find((o) => o.key === selectedModelKey);
+        openGroup = selected ? selected.group : null;
+        renderModelOptions();
         modelPickerList.hidden = false;
         modelPickerButton.setAttribute('aria-expanded', 'true');
     }

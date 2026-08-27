@@ -27,6 +27,8 @@ JOB_TRIGGER_URL = "http://localhost/max/job-trigger"
 STATIC_MODEL_OPTIONS = {
     "openrouter-nemotron": {
         "label": "OpenRouter · Nemotron 3 Ultra",
+        "group": "OpenRouter",
+        "model_label": "Nemotron 3 Ultra",
         "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
         "base_url": os.getenv("INFERENCE_HOST_URL"),
         "api_key": os.getenv("INFERENCE_API_KEY"),
@@ -82,6 +84,8 @@ def discover_ollama_models():
                 continue
             options[f"tailscale-ollama-{provider_id}:{name}"] = {
                 "label": f"Tailscale Ollama · {provider['label']} · {name}",
+                "group": provider["label"],
+                "model_label": name,
                 "model": name,
                 "base_url": provider["host_url"],
                 "api_key": provider["api_key"],

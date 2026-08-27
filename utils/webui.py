@@ -370,7 +370,13 @@ async def models_list():
     return {
         "default": get_default_model_key(),
         "options": [
-            {"key": key, "label": opts["label"], "context_length": opts["context_length"]}
+            {
+                "key": key,
+                "label": opts["label"],
+                "group": opts.get("group", opts["label"]),
+                "model_label": opts.get("model_label", opts["label"]),
+                "context_length": opts["context_length"],
+            }
             for key, opts in options.items()
         ],
     }
