@@ -14,12 +14,13 @@ import os
 import uuid
 from datetime import datetime
 
+import psutil
+import requests
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 
 from utils import agent
 from utils.agent import (
-    DEFAULT_MODEL_KEY,
     TOOL_SCHEMAS,
     _generate_reply_stream,
     _jobs_system_message,
@@ -30,6 +31,7 @@ from utils.agent import (
     _save_jobs,
     _skills_system_message,
     _sync_crontab,
+    get_default_model_key,
 )
 from utils.logging_config import get_logger
 
@@ -366,7 +368,7 @@ async def save_skill_file(filename: str, payload: dict = Body(...)):
 async def models_list():
     options = agent.refresh_model_options()
     return {
-        "default": DEFAULT_MODEL_KEY,
+        "default": get_default_model_key(),
         "options": [
             {"key": key, "label": opts["label"], "context_length": opts["context_length"]}
             for key, opts in options.items()
@@ -374,9 +376,43 @@ async def models_list():
     }
 
 
+# --- System monitor ---
+
+
+def _tailscale_ollama_reachable():
+    """Hit the Tailscale Ollama host's native /api/tags with a short timeout — same check
+    discover_ollama_models does, but without parsing the model list, just for a live status dot."""
+    host = (agent.TAILSCALE_OLLAMA_HOST_URL or "").removesuffix("/v1").rstrip("/")
+    if not host:
+        return False
+    headers = (
+        {"Authorization": f"Bearer {agent.TAILSCALE_OLLAMA_API_KEY}"}
+        if agent.TAILSCALE_OLLAMA_API_KEY
+        else {}
+    )
+    try:
+        response = requests.get(f"{host}/api/tags", headers=headers, timeout=3)
+        return response.ok
+    except Exception:
+        return False
+
+
+@router.get("/system-status")
+async def system_status():
+    vm = psutil.virtual_memory()
+    return {
+        "ollama_reachable": _tailscale_ollama_reachable(),
+        "ram": {
+            "used_mb": round((vm.total - vm.available) / (1024 * 1024)),
+            "total_mb": round(vm.total / (1024 * 1024)),
+            "percent": vm.percent,
+        },
+    }
+
+
 @router.get("/context-usage")
-async def context_usage(model: str = DEFAULT_MODEL_KEY):
-    key = model if model in agent.MODEL_OPTIONS else DEFAULT_MODEL_KEY
+async def context_usage(model: str = None):
+    key = model if model in agent.MODEL_OPTIONS else get_default_model_key()
     context_length = agent.MODEL_OPTIONS[key]["context_length"]
     persona = _load_persona() or ""
     jobs_text = _jobs_system_message()["content"]
@@ -405,9 +441,9 @@ class _Generation:
     that (re)connects replays the buffer and then follows live.
     """
 
-    def __init__(self, user_input, model_key=DEFAULT_MODEL_KEY):
+    def __init__(self, user_input, model_key=None):
         self.user_input = user_input
-        self.model_key = model_key
+        self.model_key = model_key if model_key in agent.MODEL_OPTIONS else get_default_model_key()
         self.events = []
         self.done = False
         self.task = None
@@ -468,7 +504,7 @@ async def _replay(generation):
 
 
 @router.post("/chat")
-async def chat(user_input: str = Body(embed=True), model: str = Body(default=DEFAULT_MODEL_KEY, embed=True)):
+async def chat(user_input: str = Body(embed=True), model: str = Body(default=None, embed=True)):
     global _current_generation
     if _current_generation and not _current_generation.done:
         log.info("Chat request arrived while a generation is in flight — attaching to it")

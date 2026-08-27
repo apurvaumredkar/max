@@ -96,6 +96,137 @@ def _model_choice(model_key):
     return client, opts["model"], opts["context_length"]
 
 
+CONFIG_PATH = "context/config.json"
+
+
+def _load_config():
+    """Small persisted runtime config (currently just the last model used). {} if missing/invalid."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config(config):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+def get_default_model_key():
+    """
+    The model key to use when a request doesn't name one: whatever last successfully generated
+    a reply (persisted in context/config.json), so the picker — and scheduled jobs, which have
+    no UI to pick from — pick up where the user left off instead of always landing back on
+    DEFAULT_MODEL_KEY.
+    """
+    last_key = _load_config().get("last_model_key")
+    return last_key if last_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
+
+
+def _remember_model_key(model_key):
+    """Persist the model that just successfully generated a reply as the new default."""
+    config = _load_config()
+    if config.get("last_model_key") == model_key:
+        return
+    config["last_model_key"] = model_key
+    _save_config(config)
+
+
+def _model_fallback_candidates(preferred_key):
+    """
+    Ordered model keys to try: the requested one first, then every other configured model —
+    so a dead client (bad credentials, host unreachable, rate limited, model removed from
+    Ollama) doesn't fail the whole turn when another configured model could serve it.
+    """
+    ordered = [preferred_key] if preferred_key in MODEL_OPTIONS else []
+    ordered += [key for key in MODEL_OPTIONS if key not in ordered]
+    return ordered
+
+
+async def _complete_with_fallback(model_key, messages):
+    """
+    Call the chat-completions endpoint for model_key; on failure, retry with the next
+    configured model instead of failing the turn. Returns (response, resolved_model_key) —
+    resolved_model_key may differ from model_key if a fallback was needed, and becomes the
+    new remembered default on success.
+    """
+    candidates = _model_fallback_candidates(model_key)
+    last_error = None
+    for i, candidate_key in enumerate(candidates):
+        client, model_name, context_length = _model_choice(candidate_key)
+        try:
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
+            )
+        except Exception as e:
+            last_error = e
+            log.error(
+                "Model %s failed (%s: %s)%s",
+                candidate_key,
+                type(e).__name__,
+                e,
+                "" if i + 1 == len(candidates) else " — falling back to next model",
+            )
+            continue
+        if candidate_key != model_key:
+            log.warning("Fell back from model %s to %s", model_key, candidate_key)
+        _remember_model_key(candidate_key)
+        return response, candidate_key
+    raise last_error
+
+
+async def _stream_with_fallback(model_key, messages):
+    """
+    Streaming counterpart to _complete_with_fallback. Only falls back if the failure happens
+    before any chunk of this round has been produced — a stream that dies partway through
+    can't be safely resumed on a different model without duplicating or losing output already
+    sent to the client. Yields (resolved_model_key, chunk) pairs; resolved_model_key is stable
+    across a round's yields and becomes the new remembered default on success.
+    """
+    candidates = _model_fallback_candidates(model_key)
+    last_error = None
+    for i, candidate_key in enumerate(candidates):
+        client, model_name, context_length = _model_choice(candidate_key)
+        try:
+            stream = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                stream=True,
+                extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
+            )
+            aiter = stream.__aiter__()
+            try:
+                first_chunk = await aiter.__anext__()
+            except StopAsyncIteration:
+                if candidate_key != model_key:
+                    log.warning("Fell back from model %s to %s", model_key, candidate_key)
+                _remember_model_key(candidate_key)
+                return
+        except Exception as e:
+            last_error = e
+            log.error(
+                "Model %s failed to start a response (%s: %s)%s",
+                candidate_key,
+                type(e).__name__,
+                e,
+                "" if i + 1 == len(candidates) else " — falling back to next model",
+            )
+            continue
+        if candidate_key != model_key:
+            log.warning("Fell back from model %s to %s", model_key, candidate_key)
+        _remember_model_key(candidate_key)
+        yield candidate_key, first_chunk
+        async for chunk in aiter:
+            yield candidate_key, chunk
+        return
+    raise last_error
+
+
 embed_client = Client(host="http://localhost:11434")
 EMBED_MODEL = "all-minilm"
 
@@ -532,9 +663,9 @@ TOOL_SCHEMAS = [
 ]
 
 
-async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = DEFAULT_MODEL_KEY):
-    log.info("Generating reply (non-streaming, save_user_turn=%s)", save_user_turn)
-    client, model_name, context_length = _model_choice(model_key)
+async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = None):
+    model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
+    log.info("Generating reply (non-streaming, save_user_turn=%s, model=%s)", save_user_turn, model_key)
     persona = _load_persona()
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
@@ -551,12 +682,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     tool_calls_log = []
 
     while True:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
-        )
+        response, model_key = await _complete_with_fallback(model_key, messages)
         message = response.choices[0].message
         messages.append(
             {
@@ -618,10 +744,10 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     )
 
 
-async def _generate_reply_stream(user_input: str, model_key: str = DEFAULT_MODEL_KEY):
+async def _generate_reply_stream(user_input: str, model_key: str = None):
     """Yield event dicts; the caller serializes them for the wire."""
+    model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
     log.info("Chat request: %d chars (model=%s)", len(user_input), model_key)
-    client, model_name, context_length = _model_choice(model_key)
     persona = _load_persona()
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -640,14 +766,8 @@ async def _generate_reply_stream(user_input: str, model_key: str = DEFAULT_MODEL
         tool_call_chunks = {}
         round_content = ""
         round_thinking = ""
-        stream = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            stream=True,
-            extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
-        )
-        async for chunk in stream:
+        async for resolved_key, chunk in _stream_with_fallback(model_key, messages):
+            model_key = resolved_key
             delta = chunk.choices[0].delta
             reasoning = getattr(delta, "reasoning", None)
             if reasoning:

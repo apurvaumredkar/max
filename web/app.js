@@ -534,6 +534,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Add / edit form ---
 
+    const jobSubtabs = document.querySelectorAll('.job-subtab');
+    jobSubtabs.forEach((btn) => btn.addEventListener('click', () => {
+        jobSubtabs.forEach((b) => b.classList.toggle('active', b === btn));
+        document.querySelector('.scheduled-jobs').classList.toggle('active', btn.dataset.subtab === 'scheduled');
+        document.querySelector('.cron-jobs').classList.toggle('active', btn.dataset.subtab === 'cron');
+    }));
+
     const jobForm = document.querySelector('.job-form');
     const presetSelect = jobForm.querySelector('.job-field-preset');
     const scheduleInput = jobForm.querySelector('.job-field-schedule');
@@ -796,6 +803,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+    const contextSubtabs = document.querySelectorAll('.context-subtab');
+    contextSubtabs.forEach((btn) => btn.addEventListener('click', () => {
+        contextSubtabs.forEach((b) => b.classList.toggle('active', b === btn));
+        const active = btn.dataset.subtab;
+        document.querySelector('.context-file-list').classList.toggle('active', active === 'context');
+        document.querySelector('.skill-file-list').classList.toggle('active', active === 'skill');
+        FILE_KINDS.context.addButton.hidden = active !== 'context';
+        FILE_KINDS.skill.addButton.hidden = active !== 'skill';
+    }));
+
     const editorEmpty = document.querySelector('.editor-empty');
     const editorContent = document.querySelector('.editor-content');
     const editorFilename = document.querySelector('.editor-filename');
@@ -1037,6 +1054,30 @@ document.addEventListener('DOMContentLoaded', () => {
         loadFileList('context');
         loadFileList('skill');
     }, 20000);
+
+    // --- System monitor ---
+
+    const sysmonStatus = document.querySelector('.sysmon-status');
+    const sysmonRamValue = document.querySelector('.sysmon-ram-value');
+    const sysmonRamFill = document.querySelector('.sysmon-ram-fill');
+
+    async function loadSystemStatus() {
+        try {
+            const status = await fetch('/max/system-status').then((r) => r.json());
+            sysmonStatus.dataset.state = status.ollama_reachable ? 'up' : 'down';
+            sysmonStatus.textContent = status.ollama_reachable ? 'active' : 'unreachable';
+            const ram = status.ram;
+            sysmonRamValue.textContent = `${ram.used_mb} / ${ram.total_mb} MB (${Math.round(ram.percent)}%)`;
+            sysmonRamFill.style.width = `${ram.percent}%`;
+        } catch (error) {
+            sysmonStatus.dataset.state = 'down';
+            sysmonStatus.textContent = 'unreachable';
+            console.error('Error loading system status:', error);
+        }
+    }
+
+    loadSystemStatus();
+    setInterval(loadSystemStatus, 5000);
 
     // --- Tabs ---
 

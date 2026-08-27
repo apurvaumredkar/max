@@ -27,17 +27,39 @@
 <div class="context-panel">
     <div class="context-card">
         <div class="context-header">
-            <h2>Context Files</h2>
+            <h2>Files</h2>
+            <div class="context-subtabs" role="tablist">
+                <button class="context-subtab active" role="tab" data-subtab="context">Context</button>
+                <button class="context-subtab" role="tab" data-subtab="skill">Playbooks</button>
+            </div>
             <button class="context-file-add" aria-label="New file" title="New file">+</button>
+            <button class="skill-file-add" aria-label="New playbook" title="New playbook" hidden>+</button>
         </div>
-        <div class="context-file-list"></div>
+        <div class="context-file-list context-file-panel active"></div>
+        <div class="skill-file-list context-file-panel"></div>
     </div>
     <div class="context-card">
         <div class="context-header">
-            <h2>Playbooks</h2>
-            <button class="skill-file-add" aria-label="New playbook" title="New playbook">+</button>
+            <h2>System Monitor</h2>
         </div>
-        <div class="skill-file-list"></div>
+        <div class="sysmon-panel">
+            <div class="sysmon-row">
+                <span class="sysmon-label">Tailscale Ollama</span>
+                <span class="sysmon-status" data-state="unknown">checking…</span>
+            </div>
+            <div class="sysmon-row">
+                <span class="sysmon-label">Jetson RAM</span>
+                <span class="sysmon-value sysmon-ram-value">—</span>
+            </div>
+            <div class="sysmon-bar">
+                <div class="sysmon-bar-fill sysmon-ram-fill" style="width: 0%"></div>
+            </div>
+            <div class="sysmon-row">
+                <span class="sysmon-label">Laptop VRAM</span>
+                <span class="sysmon-value sysmon-placeholder">not connected</span>
+            </div>
+            <div class="sysmon-bar sysmon-bar-placeholder"></div>
+        </div>
     </div>
 </div>
 
@@ -125,6 +147,10 @@
     <div class="jobs-container">
         <div class="jobs-header">
             <h2>Active Jobs</h2>
+            <div class="job-subtabs" role="tablist">
+                <button class="job-subtab active" role="tab" data-subtab="scheduled">Scheduled</button>
+                <button class="job-subtab" role="tab" data-subtab="cron">Cron</button>
+            </div>
             <button class="job-add-button" aria-label="Add job" title="Add job">+</button>
         </div>
 
@@ -153,15 +179,9 @@
             </div>
         </form>
 
-        <div class="job-columns">
-            <div class="job-column">
-                <h3>Scheduled</h3>
-                <div class="scheduled-jobs"></div>
-            </div>
-            <div class="job-column">
-                <h3>Cron Jobs</h3>
-                <div class="cron-jobs"></div>
-            </div>
+        <div class="job-panels">
+            <div class="scheduled-jobs job-panel active"></div>
+            <div class="cron-jobs job-panel"></div>
         </div>
     </div>
 

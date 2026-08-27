@@ -46,26 +46,27 @@ body > .app-layout {
     box-sizing: border-box;
 }
 
-/* Scheduled and Cron sit side by side, each scrolling independently. */
-.job-columns {
-    display: flex;
-    gap: 14px;
+/* Scheduled and Cron cycle through the same area via the job-subtabs toggle. */
+.job-panels {
     flex: 1 1 auto;
     min-height: 0;
+    position: relative;
 }
 
-.job-column {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 0;
-    min-width: 0;
+.job-panel {
+    display: none;
+    height: 100%;
     min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.job-panel.active {
+    display: block;
 }
 
 .scheduled-jobs,
 .cron-jobs {
-    flex: 1 1 auto;
-    min-height: 0;
     /* auto, not scroll: an empty or short list shows no scrollbar track. */
     overflow-y: auto;
     padding-right: 4px;
@@ -230,11 +231,46 @@ pre {
     align-items: center;
     justify-content: space-between;
     flex-shrink: 0;
+    gap: 10px;
 }
 
 .context-header h2 {
     margin: 0 0 16px 0;
     font-size: 18px;
+}
+
+.context-subtabs {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    margin-bottom: 16px;
+}
+
+.context-subtab {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 999px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 5px 14px;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    outline: none;
+}
+
+.context-subtab:hover:not(.active) {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.context-subtab.active {
+    background-color: #ffffff;
+    border-color: #ffffff;
+    color: #000000;
 }
 
 .context-file-add,
@@ -261,10 +297,19 @@ pre {
 
 .context-file-list,
 .skill-file-list {
-    flex: 1 1 auto;
-    min-height: 0;
     overflow-y: auto;
     padding-right: 4px;
+}
+
+/* Context and Playbooks cycle through the same card via the context-subtabs toggle. */
+.context-file-panel {
+    display: none;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.context-file-panel.active {
+    display: block;
 }
 
 .context-file,
@@ -744,16 +789,6 @@ pre {
     color: #888888;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-}
-
-.jobs-container h3:first-of-type {
-    margin-top: 0;
-}
-
-/* Each column starts its own heading, so neither gets the stacked top margin. */
-.job-column h3 {
-    margin: 0 0 8px 0;
-    font-size: 12px;
 }
 
 .job {
@@ -1299,6 +1334,115 @@ pre {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 10px;
+}
+
+.job-subtabs {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.job-subtab {
+    background: none;
+    border: 1px solid #404040;
+    border-radius: 999px;
+    color: #999999;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 5px 14px;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    outline: none;
+}
+
+.job-subtab:hover:not(.active) {
+    color: #ffffff;
+    border-color: #555555;
+}
+
+.job-subtab.active {
+    background-color: #ffffff;
+    border-color: #ffffff;
+    color: #000000;
+}
+
+/* --- System monitor --- */
+
+.sysmon-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+}
+
+.sysmon-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+}
+
+.sysmon-label {
+    color: #999999;
+}
+
+.sysmon-value {
+    font-variant-numeric: tabular-nums;
+}
+
+.sysmon-placeholder {
+    color: #666666;
+    font-style: italic;
+}
+
+.sysmon-status {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid #404040;
+    color: #999999;
+}
+
+.sysmon-status[data-state="up"] {
+    color: #6bd57a;
+    border-color: #2e5e37;
+    background-color: rgba(107, 213, 122, 0.1);
+}
+
+.sysmon-status[data-state="down"] {
+    color: #ff6b6b;
+    border-color: #5e2e2e;
+    background-color: rgba(255, 107, 107, 0.1);
+}
+
+.sysmon-bar {
+    height: 8px;
+    border-radius: 999px;
+    background-color: #2a2a2a;
+    margin-bottom: 10px;
+    overflow: hidden;
+}
+
+.sysmon-bar-fill {
+    height: 100%;
+    background-color: #ffffff;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+}
+
+.sysmon-bar-placeholder {
+    background-image: repeating-linear-gradient(
+        45deg,
+        #2a2a2a,
+        #2a2a2a 6px,
+        #242424 6px,
+        #242424 12px
+    );
 }
 
 .job-add-button {
