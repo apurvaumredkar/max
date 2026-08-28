@@ -943,6 +943,8 @@ pre {
     list-style: none;
     width: max-content;
     max-width: 260px;
+    max-height: 344px; /* ~10 rows (32px each) + padding, rest scrolls */
+    overflow-y: auto;
     background-color: #2a2a2a;
     border: 1px solid #404040;
     border-radius: 14px;

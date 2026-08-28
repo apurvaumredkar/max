@@ -38,6 +38,49 @@ STATIC_MODEL_OPTIONS = {
 }
 DEFAULT_MODEL_KEY = "openrouter-nemotron"
 
+# Default when OpenRouter's /models doesn't report a context length for some entry.
+_OPENROUTER_DEFAULT_CONTEXT_LENGTH = 8192
+
+
+def discover_openrouter_models():
+    """
+    Query OpenRouter's /models endpoint for the full catalog, so the picker offers every model
+    available there instead of just the hardcoded Nemotron entry. The Nemotron model id itself is
+    skipped since STATIC_MODEL_OPTIONS already covers it (and must, so a picker default survives
+    even if this request fails). Unreachable/errors are logged and skipped — the static entry
+    still works.
+    """
+    base_url = os.getenv("INFERENCE_HOST_URL")
+    api_key = os.getenv("INFERENCE_API_KEY")
+    if not base_url:
+        return {}
+    static_model_id = STATIC_MODEL_OPTIONS["openrouter-nemotron"]["model"]
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    options = {}
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=10)
+        response.raise_for_status()
+        models = response.json().get("data", [])
+    except Exception as e:
+        log.error("Failed to list OpenRouter models from %s: %s", base_url, e)
+        return options
+
+    for entry in models:
+        model_id = entry.get("id")
+        if not model_id or model_id == static_model_id:
+            continue
+        name = entry.get("name") or model_id
+        options[f"openrouter:{model_id}"] = {
+            "label": f"OpenRouter · {name}",
+            "group": "OpenRouter",
+            "model_label": name,
+            "model": model_id,
+            "base_url": base_url,
+            "api_key": api_key,
+            "context_length": entry.get("context_length") or _OPENROUTER_DEFAULT_CONTEXT_LENGTH,
+        }
+    return options
+
 # Two Tailscale-reachable Ollama hosts, keyed by provider id. "work" needs no API key —
 # it's plain `ollama serve` reached over Tailscale's own network-level security.
 TAILSCALE_OLLAMA_PROVIDERS = {
@@ -104,7 +147,7 @@ def discover_ollama_models():
                 continue
             fallback = entry.get("details", {}).get("context_length") or _OLLAMA_DEFAULT_CONTEXT_LENGTH
             options[f"tailscale-ollama-{provider_id}:{name}"] = {
-                "label": f"Tailscale Ollama · {provider['label']} · {name}",
+                "label": f"Ollama · {provider['label']} · {name}",
                 "group": provider["label"],
                 "model_label": name,
                 "model": name,
@@ -115,13 +158,13 @@ def discover_ollama_models():
     return options
 
 
-MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models()}
+MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
 
 
 def refresh_model_options():
-    """Re-query the Ollama host so newly pulled/removed models show up without a restart."""
+    """Re-query the Ollama hosts and OpenRouter so newly available models show up without a restart."""
     global MODEL_OPTIONS
-    MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models()}
+    MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
     return MODEL_OPTIONS
 
 
