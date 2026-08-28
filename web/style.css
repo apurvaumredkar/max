@@ -1243,6 +1243,49 @@ pre.code-block code {
     display: none;
 }
 
+/* --- Chat toolbar (Voice toggle) --- */
+
+.chat-toolbar {
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+    font-size: 13px;
+    color: #999999;
+    flex-shrink: 0;
+}
+
+.voice-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.voice-toggle-checkbox {
+    accent-color: #1db954;
+    cursor: pointer;
+}
+
+.voice-toggle.speaking {
+    color: #1db954;
+}
+
+.voice-toggle.speaking::after {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background-color: #1db954;
+    animation: voice-pulse 1s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+}
+
 /* --- Logs tab --- */
 
 .logs-toolbar {

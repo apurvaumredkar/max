@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from utils import agent, logs, spotify, webui
+from utils import agent, logs, spotify, tts, webui
 from utils.logging_config import configure_logging, get_logger
 
 configure_logging()
@@ -35,6 +35,7 @@ app.include_router(agent.router, prefix="/max", tags=["Max Agent"])
 app.include_router(webui.router, prefix="/max", tags=["Web UI"])
 app.include_router(spotify.router, prefix="/max", tags=["Spotify"])
 app.include_router(logs.router, prefix="/max", tags=["Logs"])
+app.include_router(tts.router, prefix="/max", tags=["TTS"])
 app.mount("/assets", StaticFiles(directory="web/assets"), name="assets")
 app.mount("/static", StaticFiles(directory="web"), name="static")
 
@@ -68,7 +69,7 @@ async def favicon():
 async def spotify_callback(code: str):
     log.info("Spotify OAuth callback received")
     spotify.exchange_code_for_token(code)
-    return RedirectResponse("http://max/")
+    return RedirectResponse("/")
 
 
 if __name__ == "__main__":

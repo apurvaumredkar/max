@@ -385,12 +385,250 @@ document.addEventListener('DOMContentLoaded', () => {
         return messageEl;
     }
 
+    // --- Voice (TTS): speaks assistant replies sentence-by-sentence as they stream in ---
+
+    const VOICE_STORAGE_KEY = 'max-voice-enabled';
+    const voiceToggleLabel = document.querySelector('.voice-toggle');
+    const voiceToggleCheckbox = document.querySelector('.voice-toggle-checkbox');
+    voiceToggleCheckbox.checked = localStorage.getItem(VOICE_STORAGE_KEY) === '1';
+
+    function voiceEnabled() {
+        return voiceToggleCheckbox.checked;
+    }
+
+    // Strips markdown formatting and emoji from a chunk of assistant text so Kokoro isn't
+    // fed literal syntax (asterisks, backticks, link URLs, etc.) or unspeakable glyphs.
+    function stripForSpeech(text) {
+        return text
+            .replace(/```[\s\S]*?```/g, ' ')           // fenced code blocks
+            .replace(/`[^`]*`/g, ' ')                  // inline code
+            .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')     // images
+            .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // links -> link text
+            .replace(/^#{1,6}\s+/gm, '')                // headers
+            .replace(/^>\s?/gm, '')                     // blockquotes
+            .replace(/^\s*[-*+]\s+/gm, '')              // bullet list markers
+            .replace(/^\s*\d+\.\s+/gm, '')              // numbered list markers
+            .replace(/^\s*[-*_]{3,}\s*$/gm, '')         // horizontal rules
+            .replace(/(\*\*\*|___)(.*?)\1/g, '$2')      // bold+italic
+            .replace(/(\*\*|__)(.*?)\1/g, '$2')         // bold
+            .replace(/(\*|_)(.*?)\1/g, '$2')            // italic
+            .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu, '')
+            .replace(/[\uFE0F\u200D]/g, '')             // variation selectors / ZWJ
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    // Splits a growing text buffer into complete sentences (kept) and a trailing partial
+    // sentence (carried forward until the next delta or stream end).
+    function splitCompleteSentences(buffer) {
+        const parts = buffer.split(/(?<=[.!?])\s+(?=\S)|\n{2,}/);
+        if (parts.length <= 1) return { complete: [], remainder: buffer };
+        const remainder = parts.pop();
+        return { complete: parts, remainder };
+    }
+
+    // A plain POST-per-sentence design meant sentence N+1's synthesis only ever started once
+    // sentence N finished *playing* — every sentence had an audible gap before it while the
+    // server synthesized it from a cold start. A persistent WebSocket lets the client push
+    // sentences ahead as soon as they're segmented, so the server synthesizes them back-to-back
+    // while earlier audio is still playing — the network+synthesis round trip for sentence N+1
+    // overlaps with playback of sentence N instead of happening after it.
+    const ttsAudio = new Audio();
+    const SILENT_WAV_DATA_URI =
+        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+    let ttsSocket = null;
+    let playQueue = [];
+    // A single boolean guard plus a persistent 'ended' listener (the previous design) meant
+    // "is something playing" and "what should happen when it stops" were tracked in two places
+    // that could drift apart. Replaced with one sequential async loop: it owns the queue outright
+    // and awaits each clip fully (via playClip's promise) before ever touching the next one, so
+    // there's no window where two clips could both believe it's their turn.
+    let playLoopRunning = false;
+    let currentPlaybackAbort = null;
+
+    function setSpeakingIndicator(active) {
+        voiceToggleLabel.classList.toggle('speaking', active);
+    }
+
+    function ensureVoiceSocket() {
+        if (ttsSocket && (ttsSocket.readyState === WebSocket.OPEN || ttsSocket.readyState === WebSocket.CONNECTING)) {
+            return ttsSocket;
+        }
+        if (ttsSocket) {
+            // Replacing a socket that's CLOSING/CLOSED — close it explicitly rather than just
+            // dropping the reference, so its listeners can't still land a late frame in
+            // playQueue out of order behind the new socket's frames.
+            try { ttsSocket.close(); } catch (error) { /* already closed */ }
+        }
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const socket = new WebSocket(`${protocol}//${location.host}/max/tts/stream`);
+        socket.binaryType = 'blob';
+        socket.addEventListener('message', (event) => {
+            if (typeof event.data === 'string') {
+                // A JSON text frame means the server hit a synthesis error (see utils/tts.py)
+                // instead of sending audio bytes — surface it instead of trying to play it.
+                try {
+                    console.error('Voice stream error:', JSON.parse(event.data).error);
+                } catch (error) {
+                    console.error('Voice stream sent an unparseable error frame:', event.data);
+                }
+                return;
+            }
+            // event.data arrives as an untyped Blob (WebSocket binary frames carry no MIME
+            // type) — without an explicit type, some browsers content-sniff the WAV header
+            // unreliably as an <audio> src, which can misdetect duration and truncate/garble
+            // playback. Re-wrap it with the correct type before queuing.
+            const audioBlob = new Blob([event.data], { type: 'audio/wav' });
+            playQueue.push(audioBlob);
+            if (!playLoopRunning) runPlayLoop();
+        });
+        socket.addEventListener('error', (error) => {
+            console.error('Voice socket error:', error);
+        });
+        socket.addEventListener('close', () => {
+            // Only clear the shared reference if nothing has replaced this socket already —
+            // a stale close event from an old, already-superseded socket must not null out a
+            // newer, currently-live one.
+            if (ttsSocket === socket) ttsSocket = null;
+        });
+        ttsSocket = socket;
+        return ttsSocket;
+    }
+
+    // Plays one clip to completion (or failure) and resolves/rejects accordingly — the only
+    // thing that ever assigns ttsAudio.src, so there is exactly one clip "owning" the element
+    // at any moment.
+    function playClip(url) {
+        return new Promise((resolve, reject) => {
+            const cleanup = () => {
+                ttsAudio.removeEventListener('ended', onEnded);
+                ttsAudio.removeEventListener('error', onError);
+                currentPlaybackAbort = null;
+            };
+            const onEnded = () => { cleanup(); resolve(); };
+            const onError = () => { cleanup(); reject(new Error('audio element error')); };
+            currentPlaybackAbort = () => { cleanup(); resolve(); };
+            ttsAudio.addEventListener('ended', onEnded, { once: true });
+            ttsAudio.addEventListener('error', onError, { once: true });
+            ttsAudio.src = url;
+            ttsAudio.play().catch((error) => { cleanup(); reject(error); });
+        });
+    }
+
+    // The sole consumer of playQueue: pulls one clip at a time and awaits it fully — via
+    // playClip's promise, not a side-channel flag — before even looking at the next one.
+    async function runPlayLoop() {
+        playLoopRunning = true;
+        setSpeakingIndicator(true);
+        while (playQueue.length > 0) {
+            const blob = playQueue.shift();
+            const url = URL.createObjectURL(blob);
+            try {
+                await playClip(url);
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                URL.revokeObjectURL(url);
+                // Voice is best-effort — never let a synthesis/playback failure break the chat
+                // UI. NotAllowedError means the browser's autoplay policy blocked play() because
+                // it wasn't called inside a user gesture (see unlockAudioPlayback) — put the clip
+                // back and stop draining instead of silently discarding the whole queue; it
+                // resumes once unlockAudioPlayback succeeds on the next click.
+                console.error(`Voice playback error (${error.name}):`, error);
+                if (error.name === 'NotAllowedError') {
+                    playQueue.unshift(blob);
+                    audioUnlocked = false;
+                    break;
+                }
+            }
+        }
+        playLoopRunning = false;
+        setSpeakingIndicator(false);
+    }
+
+    let audioUnlocked = false;
+
+    function unlockAudioPlayback() {
+        // Browsers only allow play() calls made asynchronously (e.g. from a WebSocket message
+        // handler, as playClip does) once the page has played *something* directly inside a
+        // user-gesture call stack first. Do that here, synchronously inside a click handler, on
+        // ttsAudio itself — not a separate element — since some browsers (Safari/iOS) scope the
+        // unlock to the specific element that played, not the whole page. No explicit cleanup
+        // afterward either: the next real playClip() call simply overwrites .src, which safely
+        // interrupts this silent, sub-second clip — deliberately avoiding the previous design's
+        // async pause()/removeAttribute()/load() cleanup, which could run *after* real playback
+        // had already started and rip out its .src (the actual race from before).
+        if (audioUnlocked) return;
+        audioUnlocked = true;
+        ttsAudio.src = SILENT_WAV_DATA_URI;
+        const playPromise = ttsAudio.play();
+        if (playPromise) {
+            playPromise
+                .then(() => {
+                    // Something may have queued up while playback was locked — resume it.
+                    if (playQueue.length > 0 && !playLoopRunning) runPlayLoop();
+                })
+                .catch((error) => {
+                    console.error('Audio unlock failed:', error);
+                    audioUnlocked = false; // let the next click retry
+                });
+        }
+    }
+
+    // If Voice was already on from a previous session (persisted in localStorage), the
+    // checkbox gets checked programmatically on load — that's not a user gesture, so the
+    // unlock above never runs. Fall back to unlocking on whatever the user clicks first.
+    document.addEventListener('click', () => {
+        if (voiceEnabled() && !audioUnlocked) unlockAudioPlayback();
+    });
+
+    function enqueueSpeech(rawText) {
+        const clean = stripForSpeech(rawText);
+        if (!clean) return;
+        const socket = ensureVoiceSocket();
+        const send = () => {
+            // The socket can have closed (e.g. a failed connect) between when this was
+            // scheduled and when 'open' would have fired — sending on it would throw.
+            if (socket.readyState !== WebSocket.OPEN) {
+                console.error('Voice socket unavailable, dropping a chunk of speech');
+                return;
+            }
+            try {
+                socket.send(JSON.stringify({ text: clean }));
+            } catch (error) {
+                console.error('Voice send failed:', error);
+            }
+        };
+        if (socket.readyState === WebSocket.OPEN) send();
+        else socket.addEventListener('open', send, { once: true });
+    }
+
+    function stopSpeech() {
+        playQueue = [];
+        setSpeakingIndicator(false);
+        if (currentPlaybackAbort) currentPlaybackAbort(); // resolves playClip's promise so runPlayLoop exits
+        ttsAudio.pause();
+        ttsAudio.removeAttribute('src');
+        ttsAudio.load();
+        if (ttsSocket) {
+            ttsSocket.close();
+            ttsSocket = null;
+        }
+    }
+
+    voiceToggleCheckbox.addEventListener('change', () => {
+        localStorage.setItem(VOICE_STORAGE_KEY, voiceToggleCheckbox.checked ? '1' : '0');
+        if (voiceToggleCheckbox.checked) unlockAudioPlayback();
+        else stopSpeech();
+    });
+
     async function sendMessage() {
         const message = inputField.value.trim();
         if (!message) return;
         activateTab('chat');
         addMessage('You', message);
         inputField.value = '';
+        // Don't let a previous reply's leftover audio bleed into this one.
+        stopSpeech();
 
         const messageEl = createMessageEl('Max');
         try {
@@ -399,15 +637,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ user_input: message, model: selectedModelKey })
             });
+            if (!response.ok) throw new Error(`Chat request failed: ${response.status}`);
             await consumeStream(response, messageEl);
         } catch (error) {
             console.error('Error sending message:', error);
         }
     }
 
+    // Sentence-sized chunks (e.g. a bare "Sure!" or "Okay.") sound clipped and disjointed when
+    // each is synthesized in isolation — batch complete sentences together until there's a
+    // reasonable amount of text before sending them off for speech, so Kokoro gets enough
+    // context to produce natural-sounding prosody instead of a string of abrupt one-word clips.
+    const MIN_SPEECH_CHUNK_CHARS = 40;
+
     async function consumeStream(response, messageEl) {
         let contentText = '';
         let liveThinkingEl = null;
+        let speechBuffer = '';
+        let pendingSpeech = '';
         {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
@@ -434,11 +681,29 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else if (event.type === 'content') {
                         contentText += event.delta;
                         messageEl.querySelector('.content').innerHTML = renderMarkdown(contentText);
+                        if (voiceEnabled()) {
+                            speechBuffer += event.delta;
+                            const { complete, remainder } = splitCompleteSentences(speechBuffer);
+                            complete.forEach((sentence) => {
+                                pendingSpeech += (pendingSpeech ? ' ' : '') + sentence;
+                                if (pendingSpeech.length >= MIN_SPEECH_CHUNK_CHARS) {
+                                    enqueueSpeech(pendingSpeech);
+                                    pendingSpeech = '';
+                                }
+                            });
+                            speechBuffer = remainder;
+                        }
                     } else if (event.type === 'done') {
                         collapseReasoning(messageEl);
                         messageEl.querySelector('.timestamp').textContent = event.turn.timestamp;
                         if (event.turn.id) messageEl.dataset.turnId = event.turn.id;
                         loadContextUsage();
+                        if (voiceEnabled()) {
+                            const finalText = (pendingSpeech ? pendingSpeech + ' ' : '') + speechBuffer;
+                            if (finalText.trim()) enqueueSpeech(finalText);
+                            pendingSpeech = '';
+                            speechBuffer = '';
+                        }
                     } else if (event.type === 'error') {
                         console.error('Generation error:', event.message);
                         messageEl.querySelector('.content').textContent =

@@ -1,0 +1,11 @@
+services:
+  kokoro-tts:
+    build: .
+    image: max-kokoro-tts:latest
+    container_name: max-kokoro-tts
+    runtime: nvidia
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8880:8880"
+    volumes:
+      - ./models:/models
