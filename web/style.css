@@ -149,7 +149,9 @@ pre {
 }
 
 .chat-column {
-    /* Middle column: takes whatever width is left between the context panel and sidebar. */
+    /* Middle column: takes whatever width is left between the context panel and sidebar.
+       No top clearance here — .tab-bar and .container both sit flush at the top; well clear
+       of the fixed logo horizontally, so no margin is needed. */
     flex: 1 1 auto;
     min-width: 0;
     height: 100%;
@@ -204,9 +206,10 @@ pre {
 .context-panel {
     flex: 0 0 auto;
     width: 320px;
-    /* Cleared below the fixed ascii-art logo; the other columns keep the full height. */
-    margin-top: 90px;
-    height: calc(100% - 90px);
+    /* Cleared below the fixed ascii-art logo, which sits in this column's own horizontal
+       range; .chat-column/.sidebar don't need this since the logo doesn't reach them. */
+    margin-top: 76px;
+    height: calc(100% - 76px);
     display: flex;
     flex-direction: column;
     gap: 20px;
@@ -1092,6 +1095,36 @@ pre {
     border-radius: 4px;
     font-family: monospace;
     font-size: 13px;
+}
+
+/* Fenced code blocks — used by both the chat bubbles (.message .content) and the Context
+   Files/Playbooks editor preview (.editor-preview), so this is intentionally unscoped rather
+   than duplicated per container. Overrides the page's bare `pre` rule (the fixed-position ascii
+   logo), so this needs to explicitly reset every property that rule sets, not just add new ones. */
+pre.code-block {
+    position: static;
+    top: auto;
+    left: auto;
+    z-index: auto;
+    pointer-events: auto;
+    margin: 8px 0;
+    padding: 12px 14px;
+    background-color: #1a1a1a;
+    border: 1px solid #333333;
+    border-radius: 10px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.4;
+    white-space: pre;
+    word-wrap: normal;
+}
+
+pre.code-block code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+    white-space: pre;
 }
 
 .message .timestamp {

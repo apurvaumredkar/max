@@ -57,6 +57,26 @@ TAILSCALE_OLLAMA_PROVIDERS = {
 _OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
 
 
+def _ollama_model_context_length(host, headers, name, fallback):
+    """
+    /api/tags's details.context_length is only populated for a handful of custom models
+    (ones whose Modelfile sets it explicitly) — most models, including every one on the
+    work MacBook (MLX/safetensors format), omit it there entirely. /api/show's model_info
+    always has it, keyed as "<architecture>.context_length" (e.g. "gemma4.context_length"),
+    so that's the reliable source; /api/tags's field (when present) only saves this call.
+    """
+    try:
+        response = requests.post(f"{host}/api/show", headers=headers, json={"model": name}, timeout=5)
+        response.raise_for_status()
+        model_info = response.json().get("model_info", {})
+        for key, value in model_info.items():
+            if key.endswith(".context_length"):
+                return value
+    except Exception as e:
+        log.error("Failed to fetch context length for %s from %s: %s", name, host, e)
+    return fallback
+
+
 def discover_ollama_models():
     """
     Query each Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
@@ -82,6 +102,7 @@ def discover_ollama_models():
             name = entry.get("model") or entry.get("name")
             if not name:
                 continue
+            fallback = entry.get("details", {}).get("context_length") or _OLLAMA_DEFAULT_CONTEXT_LENGTH
             options[f"tailscale-ollama-{provider_id}:{name}"] = {
                 "label": f"Tailscale Ollama · {provider['label']} · {name}",
                 "group": provider["label"],
@@ -89,8 +110,7 @@ def discover_ollama_models():
                 "model": name,
                 "base_url": provider["host_url"],
                 "api_key": provider["api_key"],
-                "context_length": entry.get("details", {}).get("context_length")
-                or _OLLAMA_DEFAULT_CONTEXT_LENGTH,
+                "context_length": _ollama_model_context_length(host, headers, name, fallback),
             }
     return options
 
@@ -109,7 +129,10 @@ def _model_choice(model_key):
     """Resolve a UI model key to a client + model id + context window, falling back to the default."""
     key = model_key if model_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
     opts = MODEL_OPTIONS[key]
-    client = AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"])
+    # AsyncOpenAI's own validation rejects a falsy api_key outright (it doesn't just get sent
+    # and ignored) — a provider like the work MacBook's plain `ollama serve`, with no auth at
+    # all, still needs some non-empty placeholder to satisfy the client constructor.
+    client = AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"] or "ollama")
     return client, opts["model"], opts["context_length"]
 
 
@@ -373,6 +396,51 @@ def _execute_bash(command: str):
         "stdout": result.stdout,
         "stderr": result.stderr,
         "returncode": result.returncode,
+    }
+
+
+_READ_DEFAULT_LIMIT = 300  # lines returned by default
+_READ_MAX_CHARS = 8000  # hard backstop regardless of line count (e.g. one huge minified line)
+
+
+def _read_file(path: str, offset: int = 1, limit: int = _READ_DEFAULT_LIMIT):
+    """
+    Read a slice of a text file's contents — the token-efficient alternative to `cat` via
+    _execute_bash, which dumps the entire file regardless of size. Returns up to `limit` lines
+    starting at `offset`, plus the file's total line count, so you know whether to page further
+    with a later offset.
+
+    Args:
+        path: Path to the file to read (absolute, or relative to the working directory).
+        offset: 1-indexed line number to start reading from. Defaults to the start of the file.
+        limit: Maximum number of lines to return. Defaults to 300 — raise it only for a file you
+            know is short, otherwise page through a long one with successive offsets.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    total_lines = len(lines)
+    start = max(offset, 1)
+    # start past the end of the file means nothing to return — end_line should reflect that
+    # (an empty range) rather than being clamped back to total_lines, which would put it before
+    # start_line and misreport what was actually read.
+    end = start - 1 if start > total_lines else min(start + max(limit, 1) - 1, total_lines)
+    content = "".join(lines[start - 1 : end])
+
+    char_truncated = len(content) > _READ_MAX_CHARS
+    if char_truncated:
+        content = content[:_READ_MAX_CHARS]
+
+    return {
+        "path": path,
+        "total_lines": total_lines,
+        "start_line": start,
+        "end_line": end,
+        "content": content,
+        "truncated": end < total_lines or char_truncated,
     }
 
 
@@ -668,6 +736,7 @@ def sync_crontab_on_startup():
 
 AVAILABLE_TOOLS = {
     "_execute_bash": _execute_bash,
+    "_read_file": _read_file,
     "_cron": _cron,
     "_schedule": _schedule,
     "_search_history": _search_history,

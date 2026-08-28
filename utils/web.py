@@ -1,18 +1,24 @@
 """
-Web search via the Gemini API's Grounding with Google Search tool.
+Web search (Gemini API's Grounding with Google Search) and page fetching.
 
 Standalone helper, like google_drive.py and spotify.py — Max invokes it through
 `_execute_bash` rather than as a registered tool:
 
-    python utils/web_search.py "who won the 2026 world cup"
-    python utils/web_search.py "latest on the liverpool transfer window" --sources-only
-    python utils/web_search.py "python 3.13 release notes" --json
+    python utils/web.py --search "who won the 2026 world cup"
+    python utils/web.py --search "latest on the liverpool transfer window" --sources-only
+    python utils/web.py --search "python 3.13 release notes" --json
+    python utils/web.py --fetch "https://example.com/some-article"
+    python utils/web.py --fetch "https://example.com/some-article" --json
 
-Output is markdown by default: the answer with inline [1][2] citation markers, then a
-numbered source list. Publisher URLs are resolved by default so the links are quotable.
-Pass --json for the raw structure, --raw-urls to skip redirect resolution.
-
+--search output is markdown by default: the answer with inline [1][2] citation markers,
+then a numbered source list. Publisher URLs are resolved by default so the links are
+quotable. Pass --json for the raw structure, --raw-urls to skip redirect resolution.
 Requires GEMINI_API_KEY in secrets/.env.
+
+--fetch downloads one page and strips it down to its readable text (script/style/markup
+removed) — for reading a specific URL's content, as opposed to --search's "find and
+answer from the web" grounding. No API key needed; --json wraps the same result in JSON
+instead of printing it directly.
 
 Why grounding rather than a plain completion: the response carries a
 `groundingMetadata` block alongside the prose, giving the actual sources the answer
@@ -36,11 +42,13 @@ import os
 import re
 import subprocess
 import sys
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-# Run either as a module (`python -m utils.web_search`) or as a script
-# (`python utils/web_search.py`) — the latter needs the repo root on the path
+# Run either as a module (`python -m utils.web`) or as a script
+# (`python utils/web.py`) — the latter needs the repo root on the path
 # before `utils.` resolves.
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -258,16 +266,135 @@ def _annotate(answer, citations):
     return encoded.decode("utf-8", errors="replace")
 
 
+# --- Page fetching ---
+
+FETCH_TIMEOUT_SECONDS = 20
+FETCH_MAX_CHARS = 8000
+FETCH_USER_AGENT = "Mozilla/5.0 (compatible; MaxAgent/1.0)"
+
+# Tags whose text content isn't real page content — code/styling, or the site chrome
+# (nav menus, headers/footers, forms, icon SVGs) rather than the article/body text itself.
+_SKIP_TAGS = {
+    "script", "style", "noscript", "template",
+    "nav", "header", "footer", "aside", "form", "button", "svg", "iframe",
+}
+# Block-level tags: a line break is inserted at each boundary so the extracted text keeps
+# roughly the page's paragraph/heading/list structure instead of running everything together.
+_BLOCK_TAGS = {
+    "p", "div", "br", "li", "tr", "section", "article", "header", "footer",
+    "blockquote", "pre", "h1", "h2", "h3", "h4", "h5", "h6",
+}
+
+
+class _TextExtractor(HTMLParser):
+    """Strips a page down to its visible text — no tags, no script/style content — while
+    keeping a `<title>` and rough line breaks at block-tag boundaries for readability."""
+
+    def __init__(self):
+        super().__init__()
+        self._chunks = []
+        self._title_chunks = []
+        self._skip_depth = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in _SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif tag == "title":
+            self._in_title = False
+        elif tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        (self._title_chunks if self._in_title else self._chunks).append(data)
+
+    def text(self):
+        raw = "".join(self._chunks)
+        # Collapse runs of horizontal whitespace within a line, drop blank lines, but keep
+        # the line breaks the block tags inserted.
+        lines = (re.sub(r"[ \t]+", " ", line).strip() for line in raw.splitlines())
+        return "\n".join(line for line in lines if line)
+
+    def title(self):
+        return "".join(self._title_chunks).strip()
+
+
+def fetch(url, max_chars=FETCH_MAX_CHARS):
+    """
+    Fetch a web page and return its readable text — script/style/markup stripped out —
+    instead of raw HTML, so an LLM can read it as plain context.
+
+    Args:
+        url: The page to fetch; must start with http:// or https://.
+        max_chars: Maximum characters of extracted text to return. The page is truncated
+            (not the fetch itself) beyond this so one large page can't blow out the context
+            it's being read into.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL must start with http:// or https://: {url!r}")
+
+    log.info("Web fetch: %s", url)
+    result = subprocess.run(
+        [
+            "curl", "-sS", "-L",
+            "--max-time", str(FETCH_TIMEOUT_SECONDS),
+            "--max-redirs", "5",
+            "-A", FETCH_USER_AGENT,
+            url,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"curl failed ({result.returncode}): {result.stderr.strip()[:300]}")
+
+    parser = _TextExtractor()
+    parser.feed(result.stdout)
+    content = parser.text()
+    truncated = len(content) > max_chars
+
+    log.info("Web fetch of %s returned %d chars (truncated=%s)", url, len(content), truncated)
+    return {
+        "url": url,
+        "title": parser.title(),
+        "content": content[:max_chars],
+        "truncated": truncated,
+    }
+
+
+def format_fetch_result(result):
+    """Render a fetch result as markdown for an LLM to read."""
+    lines = [f"# {result['title'] or result['url']}", f"Source: {result['url']}", ""]
+    lines.append(result["content"])
+    if result.get("truncated"):
+        lines.append("\n(truncated — page content is longer than what's shown here)")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Search the web via Gemini grounding. Prints markdown by default."
+        description="Search the web (Gemini grounding) or fetch a page's readable text. "
+        "Prints markdown by default."
     )
-    parser.add_argument("query", help="What to search for")
-    parser.add_argument("--model", default=MODEL, help=f"Model (default: {MODEL})")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--search", metavar="QUERY", help="Search the web via Gemini grounding")
+    mode.add_argument("--fetch", metavar="URL", help="Fetch a page and extract its readable text")
+    parser.add_argument("--model", default=MODEL, help=f"--search only: model (default: {MODEL})")
     parser.add_argument(
         "--sources-only",
         action="store_true",
-        help="Print just the sources, omitting the prose answer",
+        help="--search only: print just the sources, omitting the prose answer",
     )
     parser.add_argument(
         "--json",
@@ -277,7 +404,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--raw-urls",
         action="store_true",
-        help="Keep the grounding redirect URLs instead of resolving to publisher links",
+        help="--search only: keep the grounding redirect URLs instead of resolving to publisher links",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=FETCH_MAX_CHARS,
+        help=f"--fetch only: max characters of page text to return (default: {FETCH_MAX_CHARS})",
     )
     args = parser.parse_args()
 
@@ -294,20 +427,21 @@ if __name__ == "__main__":
     root.addHandler(stderr_handler)
 
     try:
-        # Redirect blobs are unreadable and unquotable, so resolve by default and
-        # make keeping them the opt-in.
-        result = search(
-            args.query, model=args.model, resolve_urls=not args.raw_urls
-        )
+        if args.search is not None:
+            # Redirect blobs are unreadable and unquotable, so resolve by default and
+            # make keeping them the opt-in.
+            result = search(args.search, model=args.model, resolve_urls=not args.raw_urls)
+        else:
+            result = fetch(args.fetch, max_chars=args.max_chars)
     except Exception as e:
         if args.json:
             print(json.dumps({"error": str(e)}))
         else:
-            print(f"Search failed: {e}")
+            print(f"{'Search' if args.search is not None else 'Fetch'} failed: {e}")
         raise SystemExit(1)
 
     if args.json:
-        if args.sources_only:
+        if args.search is not None and args.sources_only:
             print(
                 json.dumps(
                     {"sources": result["sources"], "queries": result["queries"]},
@@ -316,5 +450,7 @@ if __name__ == "__main__":
             )
         else:
             print(json.dumps(result, indent=2))
-    else:
+    elif args.search is not None:
         print(format_result(result, include_answer=not args.sources_only))
+    else:
+        print(format_fetch_result(result))

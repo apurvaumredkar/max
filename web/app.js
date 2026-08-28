@@ -57,7 +57,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 groupEl.className = 'model-picker-group' + (hasSelection ? ' active-group' : '');
                 groupEl.setAttribute('role', 'option');
                 groupEl.innerHTML = `<span>${group}</span><span class="model-picker-count">${opts.length}</span>`;
-                groupEl.addEventListener('click', () => {
+                groupEl.addEventListener('click', (event) => {
+                    event.stopPropagation();
                     openGroup = group;
                     renderModelOptions();
                 });
@@ -69,7 +70,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const backEl = document.createElement('li');
         backEl.className = 'model-picker-back';
         backEl.textContent = '‹ ' + openGroup;
-        backEl.addEventListener('click', () => {
+        backEl.addEventListener('click', (event) => {
+            event.stopPropagation();
             openGroup = null;
             renderModelOptions();
         });
@@ -168,13 +170,39 @@ document.addEventListener('DOMContentLoaded', () => {
             .replace(/`(.+?)`/g, '<code>$1</code>');
     }
 
+    // Splits ```-fenced code blocks out of `text` first, so their content (which routinely
+    // contains backticks/asterisks/#/- of its own) never gets run through either renderer's
+    // markdown formatting — then renders the non-fenced segments with `renderText` and the
+    // fenced ones as plain, escaped <pre><code> blocks. String.split with a 2-group regex
+    // interleaves [text, lang, code, text, lang, code, ..., text].
+    function withCodeFences(text, renderText) {
+        const parts = text.split(/```(\w*)\n?([\s\S]*?)```/g);
+        let html = '';
+        for (let i = 0; i < parts.length; i += 3) {
+            html += renderText(parts[i]);
+            if (i + 1 >= parts.length) break;
+            const lang = parts[i + 1];
+            const code = parts[i + 2]
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            const langClass = lang ? ` class="language-${lang}"` : '';
+            html += `<pre class="code-block"><code${langClass}>${code}</code></pre>`;
+        }
+        return html;
+    }
+
     function renderMarkdown(text) {
-        return renderInlineMarkdown(text).replace(/\n/g, '<br>');
+        return withCodeFences(text, (segment) => renderInlineMarkdown(segment).replace(/\n/g, '<br>'));
     }
 
     // Block-level renderer for the Editor tab's Preview — headers and lists on top of
     // renderMarkdown's inline formatting, since context/*.md files use both.
     function renderMarkdownDocument(text) {
+        return withCodeFences(text, renderMarkdownDocumentBlock);
+    }
+
+    function renderMarkdownDocumentBlock(text) {
         let html = '';
         let inList = false;
         const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
