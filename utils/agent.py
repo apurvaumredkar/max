@@ -664,11 +664,8 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
     return {"status": "created", "name": name, "run_at": run_at, "prompt": prompt}
 
 
-def _jobs_system_message():
-    """
-    Render the currently installed jobs as a system message. Active context is only today's chat,
-    so without this Max cannot see reminders it set on an earlier day and creates duplicates.
-    """
+def _jobs_listing():
+    """The bare job list — the value of the {{JOBS}} persona variable."""
     jobs = _load_jobs()
     lines = []
     for job in jobs.get("cron", []):
@@ -682,13 +679,19 @@ def _jobs_system_message():
             f"→ #{job.get('channel', 'reminders')}: {job['prompt']}"
         )
     if not lines:
-        body = "There are currently no reminders or scheduled jobs set."
-    else:
-        body = "Reminders and scheduled jobs you have already set:\n" + "\n".join(lines)
+        return "There are currently no reminders or scheduled jobs set."
+    return "Reminders and scheduled jobs you have already set:\n" + "\n".join(lines)
+
+
+def _jobs_system_message():
+    """
+    Fallback wrapper for {{JOBS}} when SYSTEM.md doesn't place it. Active context is only today's
+    chat, so without this Max can't see reminders it set on an earlier day and creates duplicates.
+    """
     return {
         "role": "system",
         "content": (
-            f"{body}\n\n"
+            f"{_jobs_listing()}\n\n"
             "This list is the full set of jobs across all days — your chat context only covers "
             "today. Check it before creating a new job: if an equivalent one already exists, say "
             "so instead of creating a duplicate."
@@ -696,11 +699,12 @@ def _jobs_system_message():
     }
 
 
+CONTEXT_DIR = "context"
 SKILLS_DIR = "context/skills"
 
 
-def _parse_skill_frontmatter(content):
-    """Extract `name`/`description` from a skill file's leading YAML frontmatter, if present."""
+def _parse_frontmatter(content):
+    """Extract `name`/`description` from a markdown file's leading YAML frontmatter, if present."""
     if not content.startswith("---"):
         return None, None
     end = content.find("\n---", 3)
@@ -736,35 +740,141 @@ def _load_skills():
         except Exception as e:
             log.error("Failed to read skill file %s: %s", path, e)
             continue
-        name, description = _parse_skill_frontmatter(content)
+        name, description = _parse_frontmatter(content)
         skills.append(
             {"filename": filename, "name": name or filename[:-3], "description": description or ""}
         )
     return skills
 
 
-def _skills_system_message():
+def _load_context_files():
     """
-    Render available playbooks as a system message — just their name/description, not their
-    full contents. Each entry is cheap (a couple lines); the full file is only worth reading
-    once a description actually matches what's being asked, via `_execute_bash`.
+    List the context files Max can read (context/**.md) with their name/description parsed from
+    frontmatter. Discovered by walking the tree, so a file added through the UI is visible on the
+    next turn without a code change. Skips context/skills/ (listed separately as playbooks) and
+    SYSTEM.md (this persona, already in context).
     """
-    skills = _load_skills()
-    if not skills:
-        body = "There are currently no playbooks in context/skills/."
-    else:
-        lines = [f"- `{s['filename']}` — {s['name']}: {s['description']}" for s in skills]
-        body = "Available playbooks:\n" + "\n".join(lines)
+    files = []
+    if not os.path.isdir(CONTEXT_DIR):
+        return files
+    for root, dirs, filenames in os.walk(CONTEXT_DIR):
+        rel_root = os.path.relpath(root, CONTEXT_DIR)
+        if rel_root == ".":
+            dirs[:] = [d for d in dirs if d != "skills"]
+        for filename in sorted(filenames):
+            if not filename.endswith(".md") or (rel_root == "." and filename == "SYSTEM.md"):
+                continue
+            rel_path = filename if rel_root == "." else os.path.join(rel_root, filename)
+            rel_path = rel_path.replace(os.sep, "/")
+            try:
+                with open(os.path.join(root, filename), "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                log.error("Failed to read context file %s: %s", rel_path, e)
+                continue
+            name, description = _parse_frontmatter(content)
+            files.append(
+                {
+                    "path": f"{CONTEXT_DIR}/{rel_path}",
+                    "name": name or rel_path[:-3],
+                    "description": description or "",
+                }
+            )
+    return sorted(files, key=lambda f: f["path"])
+
+
+def _context_files_listing():
+    """
+    The context file tree — paths and one-line descriptions, not contents. The value of the
+    {{CONTEXT_FILES}} persona variable. The index is cheap enough to carry every turn; a file is
+    only worth reading in full once its description matches what's being asked.
+    """
+    files = _load_context_files()
+    if not files:
+        return "There are currently no context files in context/."
+    lines = [f"- `{f['path']}` — {f['name']}: {f['description']}" for f in files]
+    return "Available context files:\n" + "\n".join(lines)
+
+
+def _context_files_system_message():
+    """Fallback wrapper for {{CONTEXT_FILES}} when SYSTEM.md doesn't place it."""
     return {
         "role": "system",
         "content": (
-            f"{body}\n\n"
-            "A playbook is a markdown file with step-by-step instructions for handling a "
-            "specific kind of task. If one's description matches what the user is asking for, "
-            "read it in full first with `_execute_bash` (e.g. `cat context/skills/<filename>`) "
-            "before acting on it — don't guess its contents from the name/description alone."
+            f"{_context_files_listing()}\n\n"
+            "These hold durable background — facts about Apurva, the people in his life, project "
+            "notes — that isn't in today's conversation. None of them are loaded automatically. "
+            "When one's description covers what you need, read it with `_read_file` before "
+            "answering rather than guessing from its name, and prefer it over `_search_history` "
+            "for background that isn't tied to a specific past conversation."
         ),
     }
+
+
+def _skills_listing():
+    """
+    Available playbooks — name/description only, not contents. The value of the {{PLAYBOOKS}}
+    persona variable.
+    """
+    skills = _load_skills()
+    if not skills:
+        return "There are currently no playbooks in context/skills/."
+    lines = [f"- `{s['filename']}` — {s['name']}: {s['description']}" for s in skills]
+    return "Available playbooks:\n" + "\n".join(lines)
+
+
+def _skills_system_message():
+    """Fallback wrapper for {{PLAYBOOKS}} when SYSTEM.md doesn't place it."""
+    return {
+        "role": "system",
+        "content": (
+            f"{_skills_listing()}\n\n"
+            "A playbook is a markdown file with step-by-step instructions for handling a "
+            "specific kind of task. If one's description matches what the user is asking for, "
+            "read it in full first with `_read_file` before acting on it — don't guess its "
+            "contents from the name/description alone."
+        ),
+    }
+
+
+# SYSTEM.md may place any of these inline as `{{NAME}}`, so the persona controls *where* live
+# state appears in its own narrative instead of it arriving as a detached block after the prompt.
+PERSONA_VARIABLES = {
+    "JOBS": _jobs_listing,
+    "PLAYBOOKS": _skills_listing,
+    "CONTEXT_FILES": _context_files_listing,
+}
+
+
+def _render_persona():
+    """Expand any {{VARIABLE}} SYSTEM.md places; returns the text and which names it used."""
+    persona = _load_persona() or ""
+    inlined = set()
+    for name, build in PERSONA_VARIABLES.items():
+        placeholder = "{{" + name + "}}"
+        if placeholder in persona:
+            persona = persona.replace(placeholder, build())
+            inlined.add(name)
+    return persona, inlined
+
+
+def system_messages():
+    """
+    The system half of every turn: the rendered persona, plus a fallback block for each variable
+    SYSTEM.md didn't place itself. A variable inlined in the persona is *not* also appended —
+    that double-injection is exactly the redundancy the placeholders exist to remove.
+    """
+    persona, inlined = _render_persona()
+    messages = [{"role": "system", "content": persona}]
+    fallbacks = {
+        "JOBS": _jobs_system_message,
+        "PLAYBOOKS": _skills_system_message,
+        "CONTEXT_FILES": _context_files_system_message,
+    }
+    for name, build in fallbacks.items():
+        if name not in inlined:
+            messages.append(build())
+    return messages
 
 
 def sync_crontab_on_startup():
@@ -795,17 +905,11 @@ TOOL_SCHEMAS = [
 async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = None):
     model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
     log.info("Generating reply (non-streaming, save_user_turn=%s, model=%s)", save_user_turn, model_key)
-    persona = _load_persona()
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [
-        {"role": "system", "content": persona},
-        _jobs_system_message(),
-        _skills_system_message(),
-        *context,
-    ]
+    messages = [*system_messages(), *context]
     if not save_user_turn:
         messages.append({"role": "user", "content": user_input})
     tool_calls_log = []
@@ -877,16 +981,10 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
     """Yield event dicts; the caller serializes them for the wire."""
     model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
     log.info("Chat request: %d chars (model=%s)", len(user_input), model_key)
-    persona = _load_persona()
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [
-        {"role": "system", "content": persona},
-        _jobs_system_message(),
-        _skills_system_message(),
-        *context,
-    ]
+    messages = [*system_messages(), *context]
     tool_calls_log = []
     content = ""
     thinking = ""

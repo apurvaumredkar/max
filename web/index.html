@@ -77,6 +77,17 @@
     </div>
 </div>
 
+<div class="injected-overlay" hidden>
+    <div class="injected-dialog">
+        <div class="injected-header">
+            <h2 class="injected-title"></h2>
+            <span class="injected-meta"></span>
+            <button class="injected-close" aria-label="Close">&times;</button>
+        </div>
+        <pre class="injected-body"></pre>
+    </div>
+</div>
+
 <div class="chat-column">
     <div class="tab-bar" role="tablist">
         <button class="tab active" role="tab" aria-selected="true" data-tab="chat">Chat</button>
@@ -128,10 +139,19 @@
     </div>
 
     <div class="context-usage-bar">
-        <div class="context-usage-track">
-            <div class="context-usage-fill"></div>
+        <button type="button" class="context-usage-toggle" aria-expanded="false" title="What's in Max's context">
+            <div class="context-usage-track">
+                <div class="context-usage-fill"></div>
+            </div>
+            <span class="context-usage-label"></span>
+            <svg class="context-usage-chevron" viewBox="0 0 24 24">
+                <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+        </button>
+        <div class="context-breakdown" hidden>
+            <div class="context-breakdown-stack"></div>
+            <div class="context-breakdown-rows"></div>
         </div>
-        <span class="context-usage-label"></span>
     </div>
 
     <div class="chat-input-bar">

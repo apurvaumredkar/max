@@ -143,20 +143,112 @@ document.addEventListener('DOMContentLoaded', () => {
     const contextUsageFill = document.querySelector('.context-usage-fill');
     const contextUsageLabel = document.querySelector('.context-usage-label');
 
+    const contextUsageToggle = document.querySelector('.context-usage-toggle');
+    const contextBreakdown = document.querySelector('.context-breakdown');
+    const contextBreakdownStack = document.querySelector('.context-breakdown-stack');
+    const contextBreakdownRows = document.querySelector('.context-breakdown-rows');
+    // Every injected block gets a fixed colour so a segment keeps its identity between polls.
+    const BLOCK_COLORS = {
+        persona: '#7aa2f7',
+        jobs: '#bb9af7',
+        skills: '#9ece6a',
+        context_files: '#e0af68',
+        history: '#7dcfff',
+        tools: '#f7768e',
+    };
+
     async function loadContextUsage() {
         if (!selectedModelKey) return;
         try {
             const response = await fetch(`/max/context-usage?model=${encodeURIComponent(selectedModelKey)}`);
-            const { percent_remaining, used_tokens, context_length } = await response.json();
+            const { percent_remaining, used_tokens, context_length, blocks } = await response.json();
             contextUsageFill.style.width = `${percent_remaining}%`;
             contextUsageFill.classList.toggle('warn', percent_remaining <= 50 && percent_remaining > 20);
             contextUsageFill.classList.toggle('critical', percent_remaining <= 20);
             contextUsageLabel.textContent = `${percent_remaining}% context remaining`;
             contextUsageLabel.title = `${used_tokens.toLocaleString()} / ${context_length.toLocaleString()} tokens (estimated)`;
+            renderContextBreakdown(blocks || [], used_tokens);
         } catch (error) {
             console.error('Error loading context usage:', error);
         }
     }
+
+    // Shows what Max is actually being fed each turn, block by block — the injected system
+    // messages are assembled server-side and are otherwise invisible from the UI.
+    function renderContextBreakdown(blocks, usedTokens) {
+        contextBreakdownStack.innerHTML = '';
+        contextBreakdownRows.innerHTML = '';
+        const total = usedTokens || blocks.reduce((sum, b) => sum + b.tokens, 0) || 1;
+        blocks.forEach((block) => {
+            const share = (100 * block.tokens) / total;
+            const color = BLOCK_COLORS[block.key] || '#888';
+
+            const segment = document.createElement('div');
+            segment.className = 'context-breakdown-segment';
+            segment.style.width = `${share}%`;
+            segment.style.backgroundColor = color;
+            segment.title = `${block.label} — ${block.tokens.toLocaleString()} tokens`;
+            contextBreakdownStack.appendChild(segment);
+
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'context-breakdown-row';
+            row.innerHTML = `
+                <span class="context-breakdown-swatch" style="background-color: ${color}"></span>
+                <span class="context-breakdown-name">${block.label}</span>
+                <span class="context-breakdown-detail">${block.detail || ''}</span>
+                <span class="context-breakdown-tokens">${block.tokens.toLocaleString()}</span>
+                <span class="context-breakdown-share">${share.toFixed(0)}%</span>`;
+            row.addEventListener('click', () => openInjectedBlock(block.key));
+            contextBreakdownRows.appendChild(row);
+        });
+    }
+
+    contextUsageToggle.addEventListener('click', () => {
+        const open = contextBreakdown.hidden;
+        contextBreakdown.hidden = !open;
+        contextUsageToggle.setAttribute('aria-expanded', String(open));
+        if (open) loadContextUsage();
+    });
+
+    // --- Injected block viewer ---
+
+    const injectedOverlay = document.querySelector('.injected-overlay');
+    const injectedTitle = document.querySelector('.injected-title');
+    const injectedMeta = document.querySelector('.injected-meta');
+    const injectedBody = document.querySelector('.injected-body');
+
+    async function openInjectedBlock(key) {
+        injectedOverlay.hidden = false;
+        injectedTitle.textContent = 'Loading…';
+        injectedMeta.textContent = '';
+        injectedBody.textContent = '';
+        try {
+            // Contents are fetched only on open — the 20s usage poll carries token counts alone.
+            const response = await fetch(`/max/injected-context?key=${encodeURIComponent(key)}`);
+            const block = await response.json();
+            if (block.error) throw new Error(block.error);
+            injectedTitle.textContent = block.label;
+            injectedMeta.textContent = `${block.detail || ''} · ${block.tokens.toLocaleString()} tokens`;
+            injectedBody.textContent = block.content || '(empty)';
+        } catch (error) {
+            console.error('Error loading injected block:', error);
+            injectedTitle.textContent = 'Could not load block';
+            injectedBody.textContent = String(error);
+        }
+    }
+
+    function closeInjectedBlock() {
+        injectedOverlay.hidden = true;
+    }
+
+    document.querySelector('.injected-close').addEventListener('click', closeInjectedBlock);
+    injectedOverlay.addEventListener('click', (event) => {
+        if (event.target === injectedOverlay) closeInjectedBlock();
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !injectedOverlay.hidden) closeInjectedBlock();
+    });
 
     setInterval(loadContextUsage, 20000);
 
@@ -1200,11 +1292,45 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // SYSTEM.md places live state as {{JOBS}}/{{PLAYBOOKS}}/{{CONTEXT_FILES}}, expanded server-side
+    // at injection time. The preview expands them too, so what's on screen is what the model gets;
+    // the Markdown tab and save deliberately keep the raw placeholders, since saving an expanded
+    // copy would freeze a snapshot into the persona.
+    let personaVariables = {};
+
+    async function loadPersonaVariables() {
+        try {
+            const response = await fetch('/max/persona-variables');
+            personaVariables = await response.json();
+        } catch (error) {
+            console.error('Error loading persona variables:', error);
+        }
+    }
+
+    function expandPersonaVariables(text) {
+        return text.replace(/\{\{([A-Z_]+)\}\}/g, (match, name) =>
+            name in personaVariables ? personaVariables[name] : match
+        );
+    }
+
+    function hasPersonaVariables(text) {
+        return /\{\{[A-Z_]+\}\}/.test(text);
+    }
+
     function setEditorSubtab(name) {
         editorSubtabs.forEach((btn) => btn.classList.toggle('active', btn.dataset.subtab === name));
         editorTextarea.hidden = name !== 'markdown';
         editorPreview.hidden = name !== 'preview';
-        if (name === 'preview') editorPreview.innerHTML = renderMarkdownDocument(editorTextarea.value);
+        if (name === 'preview') {
+            const render = () =>
+                (editorPreview.innerHTML = renderMarkdownDocument(expandPersonaVariables(editorTextarea.value)));
+            render();
+            // A variable typed into a file that had none won't have values cached yet — fetch
+            // them, then re-render rather than leaving a raw placeholder on screen.
+            if (hasPersonaVariables(editorTextarea.value) && !Object.keys(personaVariables).length) {
+                loadPersonaVariables().then(render);
+            }
+        }
     }
 
     editorSubtabs.forEach((btn) => btn.addEventListener('click', () => setEditorSubtab(btn.dataset.subtab)));
@@ -1257,6 +1383,7 @@ document.addEventListener('DOMContentLoaded', () => {
             editorFilename.hidden = false;
             editorFilenameInput.hidden = true;
             editorTextarea.value = result.content;
+            if (hasPersonaVariables(result.content)) await loadPersonaVariables();
             editorTokens.textContent = formatTokenCount(result.tokens);
             editorError.textContent = '';
             editorSave.hidden = true;

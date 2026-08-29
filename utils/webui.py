@@ -416,23 +416,111 @@ async def system_status():
     }
 
 
+def _context_blocks():
+    """
+    The pieces both agent loops assemble into `messages` every turn, in the order they're sent.
+
+    One builder for the usage meter and the viewer, so the meter can never drift from what's
+    actually injected — the way it silently under-reported when the context-files block was added.
+    Anything added to the loops' message list belongs here too.
+    """
+    history = _load_history()
+    persona, inlined = agent._render_persona()
+    blocks = [
+        {
+            "key": "persona",
+            "label": "Persona",
+            # Say so when SYSTEM.md placed the live blocks itself — otherwise the persona looks
+            # inexplicably large and the missing rows look like a bug.
+            "detail": (
+                f"context/SYSTEM.md · {{{{{'}}, {{'.join(sorted(inlined))}}}}} expanded inline"
+                if inlined
+                else "context/SYSTEM.md"
+            ),
+            "content": persona,
+        },
+    ]
+    # A variable SYSTEM.md inlined is already counted inside the persona — listing it again would
+    # double-count it in the meter.
+    if "JOBS" not in inlined:
+        blocks.append({
+            "key": "jobs",
+            "label": "Jobs",
+            "detail": "context/jobs.json",
+            "content": _jobs_system_message()["content"],
+        })
+    if "PLAYBOOKS" not in inlined:
+        blocks.append({
+            "key": "skills",
+            "label": "Playbooks",
+            "detail": "listing of context/skills/",
+            "content": _skills_system_message()["content"],
+        })
+    if "CONTEXT_FILES" not in inlined:
+        blocks.append({
+            "key": "context_files",
+            "label": "Context files",
+            "detail": "listing of context/**.md",
+            "content": agent._context_files_system_message()["content"],
+        })
+    blocks += [
+        {
+            "key": "history",
+            "label": "Today's chat",
+            "detail": f"{len(history)} turns",
+            "content": "".join(turn.get("content") or "" for turn in history),
+        },
+        {
+            "key": "tools",
+            "label": "Tool schemas",
+            "detail": f"{len(TOOL_SCHEMAS)} tools",
+            "content": json.dumps(TOOL_SCHEMAS),
+        },
+    ]
+    return blocks
+
+
 @router.get("/context-usage")
 async def context_usage(model: str = None):
+    """Token totals per injected block. No block contents — this is polled every 20s."""
     key = model if model in agent.MODEL_OPTIONS else get_default_model_key()
     context_length = agent.MODEL_OPTIONS[key]["context_length"]
-    persona = _load_persona() or ""
-    jobs_text = _jobs_system_message()["content"]
-    skills_text = _skills_system_message()["content"]
-    history = _load_history()
-    history_text = "".join(turn.get("content") or "" for turn in history)
-    tool_schemas_text = json.dumps(TOOL_SCHEMAS)
-    used_tokens = _estimate_tokens(persona + jobs_text + skills_text + history_text + tool_schemas_text)
+    blocks = [
+        {
+            "key": b["key"],
+            "label": b["label"],
+            "detail": b["detail"],
+            "tokens": _estimate_tokens(b["content"]),
+        }
+        for b in _context_blocks()
+    ]
+    used_tokens = sum(b["tokens"] for b in blocks)
     return {
         "model": key,
         "context_length": context_length,
         "used_tokens": used_tokens,
         "percent_remaining": max(0, round(100 * (1 - used_tokens / context_length))),
+        "blocks": blocks,
     }
+
+
+@router.get("/persona-variables")
+async def persona_variables():
+    """
+    Live values of the `{{NAME}}` placeholders SYSTEM.md can inline, so the editor's preview can
+    show what the model actually receives instead of the raw placeholder text. The Markdown tab and
+    saving stay on the raw file — expanding on save would bake a snapshot into the persona.
+    """
+    return {name: build() for name, build in agent.PERSONA_VARIABLES.items()}
+
+
+@router.get("/injected-context")
+async def injected_context(key: str):
+    """The verbatim text of one injected block, for the viewer — fetched only when opened."""
+    for block in _context_blocks():
+        if block["key"] == key:
+            return {**block, "tokens": _estimate_tokens(block["content"])}
+    return {"error": f"Unknown block {key!r}"}
 
 
 # --- Streaming chat ---
@@ -494,8 +582,8 @@ class _Generation:
 _current_generation = None
 
 
-async def _replay(generation):
-    """Stream a generation's events to one client, from the beginning, then live."""
+async def iter_events(generation):
+    """Yield a generation's event dicts, from the beginning, then live."""
     seen = 0
     while True:
         await generation.wait_for_event(seen)
@@ -504,25 +592,39 @@ async def _replay(generation):
             seen += 1
             if event.get("type") == "_eof":
                 return
-            yield json.dumps(event) + "\n"
+            yield event
         if generation.done and seen >= len(generation.events):
             return
 
 
-@router.post("/chat")
-async def chat(user_input: str = Body(embed=True), model: str = Body(default=None, embed=True)):
+async def _replay(generation):
+    """Stream a generation's events to one HTTP client as NDJSON."""
+    async for event in iter_events(generation):
+        yield json.dumps(event) + "\n"
+
+
+def generation_in_flight():
+    return bool(_current_generation and not _current_generation.done)
+
+
+def start_generation(user_input, model_key=None):
+    """Start a reply, or return the in-flight one — the single-generation gate for every caller."""
     global _current_generation
-    if _current_generation and not _current_generation.done:
-        log.info("Chat request arrived while a generation is in flight — attaching to it")
-        return StreamingResponse(
-            _replay(_current_generation), media_type="application/x-ndjson"
-        )
-    generation = _Generation(user_input, model)
+    if generation_in_flight():
+        log.info("Request arrived while a generation is in flight — attaching to it")
+        return _current_generation
+    generation = _Generation(user_input, model_key)
     _current_generation = generation
     # A bare task already outlives the request that started it: the disconnect cancels
     # the StreamingResponse, not this task. (Wrapping it in shield() was a bug —
     # create_task() needs a coroutine and shield() returns a Future.)
     generation.task = asyncio.create_task(generation.run())
+    return generation
+
+
+@router.post("/chat")
+async def chat(user_input: str = Body(embed=True), model: str = Body(default=None, embed=True)):
+    generation = start_generation(user_input, model)
     return StreamingResponse(_replay(generation), media_type="application/x-ndjson")
 
 

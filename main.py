@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from utils import agent, logs, spotify, tts, webui
+from utils import agent, discord_functions, logs, spotify, tts, webui
 from utils.logging_config import configure_logging, get_logger
 
 configure_logging()
@@ -18,7 +18,10 @@ async def lifespan(app: FastAPI):
     webui.backfill_turn_ids()
     webui.backfill_job_ids()
     agent.sync_crontab_on_startup()
+    discord_task = discord_functions.start_bot()
     yield
+    if discord_task:
+        discord_task.cancel()
     log.info("Max agent shutting down")
 
 
