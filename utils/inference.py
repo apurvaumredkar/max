@@ -27,21 +27,10 @@ load_dotenv("secrets/.env")
 log = get_logger(__name__)
 
 
-# Selectable inference backends — the UI's model selector picks a key from here per request.
-# Each is an OpenAI-compatible endpoint; base_url/api_key come from secrets/.env so credentials
-# stay out of source. Nothing is hardcoded: every entry is discovered at runtime from the
-# Ollama hosts and OpenRouter's catalog, so a newly pulled model shows up without a code change
-# and a retired one disappears on its own.
-
-# Default when OpenRouter's /models doesn't report a context length for some entry.
 _OPENROUTER_DEFAULT_CONTEXT_LENGTH = 8192
 
 
 def discover_openrouter_models():
-    """
-    Query OpenRouter's /models endpoint for the full catalog. Unreachable/errors are logged and
-    skipped — the Ollama hosts still provide options.
-    """
     base_url = os.getenv("INFERENCE_HOST_URL")
     api_key = os.getenv("INFERENCE_API_KEY")
     if not base_url:
@@ -49,7 +38,9 @@ def discover_openrouter_models():
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     options = {}
     try:
-        response = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=10)
+        response = requests.get(
+            f"{base_url.rstrip('/')}/models", headers=headers, timeout=10
+        )
         response.raise_for_status()
         models = response.json().get("data", [])
     except Exception as e:
@@ -68,12 +59,12 @@ def discover_openrouter_models():
             "model": model_id,
             "base_url": base_url,
             "api_key": api_key,
-            "context_length": entry.get("context_length") or _OPENROUTER_DEFAULT_CONTEXT_LENGTH,
+            "context_length": entry.get("context_length")
+            or _OPENROUTER_DEFAULT_CONTEXT_LENGTH,
         }
     return options
 
-# Two Tailscale-reachable Ollama hosts, keyed by provider id. "work" needs no API key —
-# it's plain `ollama serve` reached over Tailscale's own network-level security.
+
 TAILSCALE_OLLAMA_PROVIDERS = {
     "home": {
         "label": "Home",
@@ -92,15 +83,10 @@ _OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
 
 
 def _ollama_model_context_length(host, headers, name, fallback):
-    """
-    /api/tags's details.context_length is only populated for a handful of custom models
-    (ones whose Modelfile sets it explicitly) — most models, including every one on the
-    work MacBook (MLX/safetensors format), omit it there entirely. /api/show's model_info
-    always has it, keyed as "<architecture>.context_length" (e.g. "gemma4.context_length"),
-    so that's the reliable source; /api/tags's field (when present) only saves this call.
-    """
     try:
-        response = requests.post(f"{host}/api/show", headers=headers, json={"model": name}, timeout=5)
+        response = requests.post(
+            f"{host}/api/show", headers=headers, json={"model": name}, timeout=5
+        )
         response.raise_for_status()
         model_info = response.json().get("model_info", {})
         for key, value in model_info.items():
@@ -112,31 +98,34 @@ def _ollama_model_context_length(host, headers, name, fallback):
 
 
 def discover_ollama_models():
-    """
-    Query each Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
-    otherwise used through) for every model currently pulled there, so the model picker always
-    reflects what's actually available instead of a hardcoded model name. A provider that's
-    unreachable is logged and skipped — the static options and the other provider still work.
-    """
     options = {}
     for provider_id, provider in TAILSCALE_OLLAMA_PROVIDERS.items():
         host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
         if not host:
             continue
-        headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
+        headers = (
+            {"Authorization": f"Bearer {provider['api_key']}"}
+            if provider["api_key"]
+            else {}
+        )
         try:
             response = requests.get(f"{host}/api/tags", headers=headers, timeout=5)
             response.raise_for_status()
             models = response.json().get("models", [])
         except Exception as e:
-            log.error("Failed to list Ollama models from %s (%s): %s", host, provider_id, e)
+            log.error(
+                "Failed to list Ollama models from %s (%s): %s", host, provider_id, e
+            )
             continue
 
         for entry in models:
             name = entry.get("model") or entry.get("name")
             if not name:
                 continue
-            fallback = entry.get("details", {}).get("context_length") or _OLLAMA_DEFAULT_CONTEXT_LENGTH
+            fallback = (
+                entry.get("details", {}).get("context_length")
+                or _OLLAMA_DEFAULT_CONTEXT_LENGTH
+            )
             options[f"tailscale-ollama-{provider_id}:{name}"] = {
                 "label": f"Ollama · {provider['label']} · {name}",
                 "group": provider["label"],
@@ -144,7 +133,9 @@ def discover_ollama_models():
                 "model": name,
                 "base_url": provider["host_url"],
                 "api_key": provider["api_key"],
-                "context_length": _ollama_model_context_length(host, headers, name, fallback),
+                "context_length": _ollama_model_context_length(
+                    host, headers, name, fallback
+                ),
             }
     return options
 
@@ -153,19 +144,12 @@ MODEL_OPTIONS = {**discover_ollama_models(), **discover_openrouter_models()}
 
 
 def refresh_model_options():
-    """Re-query the Ollama hosts and OpenRouter so newly available models show up without a restart."""
     global MODEL_OPTIONS
     MODEL_OPTIONS = {**discover_ollama_models(), **discover_openrouter_models()}
     return MODEL_OPTIONS
 
 
 def _default_model_key():
-    """
-    Last resort when no usable key is named. There is no hardcoded default: it's simply the
-    first discovered backend, which is a local Ollama model whenever a host is reachable
-    (Ollama is merged before the OpenRouter catalog). Raises rather than KeyError-ing deeper
-    in, so "nothing was discovered" reads as itself in the logs.
-    """
     if not MODEL_OPTIONS:
         raise RuntimeError(
             "No inference backends discovered — every Ollama host and OpenRouter were "
@@ -175,12 +159,8 @@ def _default_model_key():
 
 
 def _model_choice(model_key):
-    """Resolve a UI model key to a client + model id + context window, falling back to the default."""
     key = model_key if model_key in MODEL_OPTIONS else _default_model_key()
     opts = MODEL_OPTIONS[key]
-    # AsyncOpenAI's own validation rejects a falsy api_key outright (it doesn't just get sent
-    # and ignored) — a provider like the work MacBook's plain `ollama serve`, with no auth at
-    # all, still needs some non-empty placeholder to satisfy the client constructor.
     client = AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"] or "ollama")
     return client, opts["model"], opts["context_length"]
 
@@ -189,7 +169,6 @@ CONFIG_PATH = "context/config.json"
 
 
 def _load_config():
-    """Small persisted runtime config (currently just the last model used). {} if missing/invalid."""
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -203,18 +182,11 @@ def _save_config(config):
 
 
 def get_default_model_key():
-    """
-    The model key to use when a request doesn't name one: whatever last successfully generated
-    a reply (persisted in context/config.json), so the picker — and scheduled jobs, which have
-    no UI to pick from — pick up where the user left off instead of always landing back on
-    the first discovered backend.
-    """
     last_key = _load_config().get("last_model_key")
     return last_key if last_key in MODEL_OPTIONS else _default_model_key()
 
 
 def _remember_model_key(model_key):
-    """Persist the model that just successfully generated a reply as the new default."""
     config = _load_config()
     if config.get("last_model_key") == model_key:
         return
@@ -223,37 +195,16 @@ def _remember_model_key(model_key):
 
 
 def _is_free(model_key):
-    """Ollama runs on our own hardware; on OpenRouter only the `:free` tier costs nothing."""
     return not model_key.startswith("openrouter:") or model_key.endswith(":free")
 
 
 def _model_fallback_candidates(preferred_key):
-    """
-    Ordered model keys to try: the requested one first, then every other configured model —
-    so a dead client (bad credentials, host unreachable, rate limited, model removed from
-    Ollama) doesn't fail the whole turn when another configured model could serve it.
-    """
     ordered = [preferred_key] if preferred_key in MODEL_OPTIONS else []
-    # Automatic fallback may only land on something free: the Ollama hosts, and the :free
-    # tier of the OpenRouter catalog. Walking the whole catalog meant a single rate-limited
-    # free-tier failure — the normal failure here — could silently land the turn on a billed
-    # model, which _remember_model_key would then persist as the default for every later
-    # request, scheduled jobs included. It also made a total outage take hundreds of
-    # sequential API calls to give up on. A billed model still works when picked explicitly;
-    # it just never gets chosen on the user's behalf.
     ordered += [key for key in MODEL_OPTIONS if key not in ordered and _is_free(key)]
     return ordered
 
 
 async def _complete_with_fallback(model_key, messages, tools):
-    """
-    Call the chat-completions endpoint for model_key; on failure, retry with the next
-    configured model instead of failing the turn. `tools` is the caller's tool schemas, passed
-    in rather than imported so this module stays independent of the agent loop's tool registry.
-    Returns (response, resolved_model_key) —
-    resolved_model_key may differ from model_key if a fallback was needed, and becomes the
-    new remembered default on success.
-    """
     candidates = _model_fallback_candidates(model_key)
     last_error = None
     for i, candidate_key in enumerate(candidates):
@@ -283,14 +234,6 @@ async def _complete_with_fallback(model_key, messages, tools):
 
 
 async def _stream_with_fallback(model_key, messages, tools):
-    """
-    Streaming counterpart to _complete_with_fallback. Only falls back if the failure happens
-    before any chunk of this round has been produced — a stream that dies partway through
-    can't be safely resumed on a different model without duplicating or losing output already
-    sent to the client. `tools` is the caller's tool schemas, as in _complete_with_fallback.
-    Yields (resolved_model_key, chunk) pairs; resolved_model_key is stable
-    across a round's yields and becomes the new remembered default on success.
-    """
     candidates = _model_fallback_candidates(model_key)
     last_error = None
     for i, candidate_key in enumerate(candidates):
@@ -308,7 +251,9 @@ async def _stream_with_fallback(model_key, messages, tools):
                 first_chunk = await aiter.__anext__()
             except StopAsyncIteration:
                 if candidate_key != model_key:
-                    log.warning("Fell back from model %s to %s", model_key, candidate_key)
+                    log.warning(
+                        "Fell back from model %s to %s", model_key, candidate_key
+                    )
                 _remember_model_key(candidate_key)
                 return
         except Exception as e:

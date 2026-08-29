@@ -74,12 +74,6 @@ def _api_key():
 
 
 def _post(payload, model=MODEL):
-    """
-    POST to generateContent with curl.
-
-    The key goes in the x-goog-api-key header — passing it as a ?key= query
-    parameter is rejected as invalid by this endpoint.
-    """
     url = f"{API_BASE}/{model}:generateContent"
     result = subprocess.run(
         [
@@ -113,7 +107,6 @@ def _post(payload, model=MODEL):
 
 
 def _resolve(uri):
-    """Follow a grounding redirect to the publisher URL, or return it unchanged."""
     result = subprocess.run(
         ["curl", "-sS", "-o", "/dev/null", "-w", "%{url_effective}",
          "-I", "-L", "--max-redirs", "5", "--max-time", "15", uri],
@@ -125,20 +118,6 @@ def _resolve(uri):
 
 
 def search(query, model=MODEL, resolve_urls=False):
-    """
-    Search the web and return the grounded answer with its sources.
-
-    Args:
-        query: What to search for, in natural language.
-        model: Gemini model to use; must support the google_search tool.
-        resolve_urls: Follow each source's redirect to the publisher URL.
-
-    Returns a dict with:
-        answer   — the prose answer
-        sources  — [{index, title, uri}], the pages the answer drew on
-        citations— [{text, sources: [index]}], which span came from which source
-        queries  — the search queries Gemini ran
-    """
     log.info("Web search: %r", query)
     payload = {
         "contents": [{"parts": [{"text": query}]}],
@@ -195,21 +174,11 @@ def search(query, model=MODEL, resolve_urls=False):
 
 
 def _domain(uri):
-    """Best-effort hostname for display, minus the www."""
     match = re.match(r"https?://([^/]+)", uri or "")
     return match.group(1).replace("www.", "") if match else ""
 
 
 def format_result(result, include_answer=True):
-    """
-    Render a search result as markdown for an LLM to read.
-
-    Raw JSON reads badly here: source URLs are ~200-character redirect blobs that
-    swamp the payload, and citations point at sources by bare index. This inlines
-    those indices as [1][2] markers right after the sentences they support, then
-    lists the numbered sources underneath — the shape a model already knows how to
-    read and cite from.
-    """
     lines = []
     answer = result.get("answer", "")
     sources = result.get("sources", [])
@@ -240,12 +209,6 @@ def format_result(result, include_answer=True):
 
 
 def _annotate(answer, citations):
-    """
-    Append [n] markers to the answer at the end of each cited span.
-
-    Offsets from the API are byte offsets into the UTF-8 answer, and inserting
-    shifts everything after — so work back-to-front over the encoded bytes.
-    """
     insertions = {}
     encoded = answer.encode("utf-8")
     for citation in citations:
@@ -330,16 +293,6 @@ class _TextExtractor(HTMLParser):
 
 
 def fetch(url, max_chars=FETCH_MAX_CHARS):
-    """
-    Fetch a web page and return its readable text — script/style/markup stripped out —
-    instead of raw HTML, so an LLM can read it as plain context.
-
-    Args:
-        url: The page to fetch; must start with http:// or https://.
-        max_chars: Maximum characters of extracted text to return. The page is truncated
-            (not the fetch itself) beyond this so one large page can't blow out the context
-            it's being read into.
-    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"URL must start with http:// or https://: {url!r}")
@@ -374,7 +327,6 @@ def fetch(url, max_chars=FETCH_MAX_CHARS):
 
 
 def format_fetch_result(result):
-    """Render a fetch result as markdown for an LLM to read."""
     lines = [f"# {result['title'] or result['url']}", f"Source: {result['url']}", ""]
     lines.append(result["content"])
     if result.get("truncated"):

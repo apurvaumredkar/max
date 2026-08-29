@@ -17,12 +17,6 @@ _configured = False
 
 
 def configure_logging(level=None):
-    """
-    Install a stdout handler on the root logger. Idempotent — safe to call more than once.
-
-    Level comes from the LOG_LEVEL env var (default INFO), so verbosity is changeable via
-    secrets/.env without touching code.
-    """
     global _configured
     if _configured:
         return logging.getLogger("max")
@@ -54,6 +48,5 @@ def configure_logging(level=None):
 
 
 def get_logger(name):
-    """Get a module logger. Name is trimmed to its last segment to keep log lines narrow."""
     configure_logging()
     return logging.getLogger(f"max.{name.rsplit('.', 1)[-1]}")

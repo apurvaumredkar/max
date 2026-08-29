@@ -44,7 +44,6 @@ router = APIRouter()
 
 
 def _rewrite_turns(path, turns):
-    """Atomically replace a chat file's contents — write a temp file, then rename over."""
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w") as tmp:
         for turn in turns:
@@ -53,12 +52,6 @@ def _rewrite_turns(path, turns):
 
 
 def _delete_turn(turn_id: str):
-    """
-    Remove the turn with this id from whichever chat file holds it.
-
-    Returns True if a turn was deleted. Rewrites atomically so a crash mid-write can't
-    truncate the day's history.
-    """
     if not os.path.isdir("chats"):
         return False
     for filename in sorted(os.listdir("chats")):
@@ -100,7 +93,6 @@ async def delete_history_turn(turn_id: str):
 
 
 def _find_job(jobs, job_id):
-    """Return (kind, index) for a job id, or (None, None)."""
     for kind in ("cron", "scheduled"):
         for index, job in enumerate(jobs.get(kind, [])):
             if job.get("id") == job_id:
@@ -109,7 +101,6 @@ def _find_job(jobs, job_id):
 
 
 def _validate_job(kind, payload):
-    """Return an error string if the payload is unusable, else None."""
     if not (payload.get("name") or "").strip():
         return "Name is required"
     if not (payload.get("prompt") or "").strip():
@@ -211,15 +202,10 @@ SKILLS_DIR = "context/skills"
 
 
 def _estimate_tokens(text):
-    """Rough token estimate (~4 chars/token) — no tokenizer for these models is available locally."""
     return max(1, round(len(text or "") / 4))
 
 
 def _md_path_in(directory, filename):
-    """
-    Resolve a filename — possibly nested, e.g. "sub/dir/file.md" — to a path inside
-    `directory`, or None if unsafe/invalid.
-    """
     if not filename.endswith(".md") or "\\" in filename:
         return None
     if any(part in ("", ".", "..") for part in filename.split("/")):
@@ -232,12 +218,6 @@ def _md_path_in(directory, filename):
 
 
 def _list_md_files(directory, exclude_dirs=()):
-    """
-    Recursively list .md files under `directory` as '/'-joined paths relative to it.
-    Subdirectories named in `exclude_dirs` (direct children of `directory` only) are skipped
-    entirely — used to keep context/skills/ out of the general context-files listing, since it
-    has its own dedicated Playbooks panel.
-    """
     if not os.path.isdir(directory):
         return []
     results = []
@@ -342,8 +322,6 @@ def models_list():
 
 
 def _tailscale_ollama_reachable(provider_id):
-    """Hit one Tailscale Ollama host's native /api/tags with a short timeout — same check
-    discover_ollama_models does, but without parsing the model list, just for a live status dot."""
     provider = inference.TAILSCALE_OLLAMA_PROVIDERS[provider_id]
     host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
     if not host:
@@ -373,13 +351,6 @@ def system_status():
 
 
 def _context_blocks():
-    """
-    The pieces both agent loops assemble into `messages` every turn, in the order they're sent.
-
-    One builder for the usage meter and the viewer, so the meter can never drift from what's
-    actually injected — the way it silently under-reported when the context-files block was added.
-    Anything added to the loops' message list belongs here too.
-    """
     history = _load_history()
     persona, inlined = agent._render_persona()
     blocks = [
@@ -438,7 +409,6 @@ def _context_blocks():
 
 @router.get("/context-usage")
 def context_usage(model: str = None):
-    """Token totals per injected block. No block contents — this is polled every 20s."""
     key = model if model in inference.MODEL_OPTIONS else get_default_model_key()
     context_length = inference.MODEL_OPTIONS[key]["context_length"]
     blocks = [
@@ -462,17 +432,11 @@ def context_usage(model: str = None):
 
 @router.get("/persona-variables")
 async def persona_variables():
-    """
-    Live values of the `{{NAME}}` placeholders SYSTEM.md can inline, so the editor's preview can
-    show what the model actually receives instead of the raw placeholder text. The Markdown tab and
-    saving stay on the raw file — expanding on save would bake a snapshot into the persona.
-    """
     return {name: build() for name, build in agent.PERSONA_VARIABLES.items()}
 
 
 @router.get("/injected-context")
 async def injected_context(key: str):
-    """The verbatim text of one injected block, for the viewer — fetched only when opened."""
     for block in _context_blocks():
         if block["key"] == key:
             return {**block, "tokens": _estimate_tokens(block["content"])}
@@ -511,7 +475,6 @@ class _Generation:
         self.emit({"type": "_eof"})
 
     async def wait_for_event(self, seen):
-        """Block until there are events past index `seen`, or generation is done."""
         if seen < len(self.events) or self.done:
             return
         waiter = asyncio.get_running_loop().create_future()
@@ -539,7 +502,6 @@ _current_generation = None
 
 
 async def iter_events(generation):
-    """Yield a generation's event dicts, from the beginning, then live."""
     seen = 0
     while True:
         await generation.wait_for_event(seen)
@@ -554,7 +516,6 @@ async def iter_events(generation):
 
 
 async def _replay(generation):
-    """Stream a generation's events to one HTTP client as NDJSON."""
     async for event in iter_events(generation):
         yield json.dumps(event) + "\n"
 
@@ -564,7 +525,6 @@ def generation_in_flight():
 
 
 def start_generation(user_input, model_key=None):
-    """Start a reply, or return the in-flight one — the single-generation gate for every caller."""
     global _current_generation
     if generation_in_flight():
         log.info("Request arrived while a generation is in flight — attaching to it")
@@ -586,10 +546,6 @@ async def chat(user_input: str = Body(embed=True), model: str = Body(default=Non
 
 @router.get("/chat/active")
 async def chat_active():
-    """
-    Report whether a reply is still being generated, so a freshly loaded page can
-    reattach to it instead of missing the rest of the response.
-    """
     generation = _current_generation
     if not generation or generation.done:
         return {"active": False}
@@ -598,7 +554,6 @@ async def chat_active():
 
 @router.get("/chat/attach")
 async def chat_attach():
-    """Reattach to the in-flight generation, replaying everything emitted so far."""
     generation = _current_generation
     if not generation or generation.done:
         return {"active": False}

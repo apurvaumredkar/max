@@ -8,8 +8,6 @@ import uuid
 from fastapi import APIRouter, Body
 from utils import inference
 from utils.discord_functions import send_discord_message
-# MODEL_OPTIONS is deliberately *not* imported by name — refresh_model_options() rebinds it, and
-# a from-import here would freeze the startup snapshot. Reach it as inference.MODEL_OPTIONS.
 from utils.inference import (
     EMBED_MODEL,
     _complete_with_fallback,
@@ -36,9 +34,6 @@ def _load_persona():
 
 
 def _load_history():
-    # Blank lines are skipped rather than parsed: a single trailing newline (a hand-edited
-    # file, a partial write) used to raise JSONDecodeError here and silently return [] —
-    # losing the whole day's context with nothing but a log line to show for it.
     filename = f"chats/{datetime.today().strftime('%Y%m%d')}.jsonl"
     try:
         with open(filename, "r") as chats:
@@ -114,8 +109,6 @@ def _search_history(query: str, top_k: int = 5):
 def _save_turn(turn: dict):
     d = datetime.today().strftime("%Y%m%d")
     filename = f"chats/{d}.jsonl"
-    # Stable per-turn id so the UI can delete a specific turn. Line numbers won't do —
-    # they shift as soon as anything above is removed.
     turn = {
         "id": turn.get("id") or uuid.uuid4().hex,
         **turn,
@@ -150,7 +143,9 @@ def _execute_bash(command: str):
 
 
 _READ_DEFAULT_LIMIT = 300  # lines returned by default
-_READ_MAX_CHARS = 8000  # hard backstop regardless of line count (e.g. one huge minified line)
+_READ_MAX_CHARS = (
+    8000  # hard backstop regardless of line count (e.g. one huge minified line)
+)
 
 
 def _read_file(path: str, offset: int = 1, limit: int = _READ_DEFAULT_LIMIT):
@@ -177,7 +172,11 @@ def _read_file(path: str, offset: int = 1, limit: int = _READ_DEFAULT_LIMIT):
     # start past the end of the file means nothing to return — end_line should reflect that
     # (an empty range) rather than being clamped back to total_lines, which would put it before
     # start_line and misreport what was actually read.
-    end = start - 1 if start > total_lines else min(start + max(limit, 1) - 1, total_lines)
+    end = (
+        start - 1
+        if start > total_lines
+        else min(start + max(limit, 1) - 1, total_lines)
+    )
     content = "".join(lines[start - 1 : end])
 
     char_truncated = len(content) > _READ_MAX_CHARS
@@ -216,18 +215,6 @@ def _save_jobs(jobs: dict):
 
 
 def _prune_expired_scheduled(jobs: dict):
-    """
-    Drop one-time jobs whose run_at has passed, returning the ones removed.
-
-    Not just tidiness: `_run_at_to_cron` emits no year field, so a past one-time job keeps a live
-    crontab line that fires again on the same date every year. It also stays in the {{JOBS}}
-    listing, where Max reads it as a reminder still pending.
-
-    Expiry is by *minute*, not instant: a job is pruned only once the clock has moved to a later
-    minute than its run_at, so a sync landing in the same minute the job is due can never remove
-    its cron line before it fires. Unparseable run_at values are left alone — `_run_at_to_cron`
-    already logs those, and dropping a job we failed to read would be silent data loss.
-    """
     current_minute = datetime.now().replace(second=0, microsecond=0)
     kept, removed = [], []
     for job in jobs.get("scheduled", []):
@@ -246,13 +233,6 @@ MANAGED_END = "# END max-agent jobs"
 
 
 def _sync_crontab():
-    """
-    Regenerate the managed block of the crontab from jobs.json.
-
-    jobs.json is the source of truth; the crontab is derived. Appending lines per job (the
-    old approach) let the two drift — deleting a job left its cron line behind forever.
-    Anything outside the managed markers is another tool's and is preserved verbatim.
-    """
     existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
     lines = existing.splitlines()
 
@@ -283,7 +263,9 @@ def _sync_crontab():
         log.info(
             "Pruned %d expired scheduled job(s): %s",
             len(expired),
-            ", ".join(f"{j.get('name', '?')} @ {j.get('run_at', '?')}" for j in expired),
+            ", ".join(
+                f"{j.get('name', '?')} @ {j.get('run_at', '?')}" for j in expired
+            ),
         )
 
     managed = [MANAGED_BEGIN]
@@ -321,7 +303,6 @@ def _sync_crontab():
 
 
 def _run_at_to_cron(run_at: str):
-    """Convert "YYYY-MM-DD HH:MM" to a 5-field cron expression, or None if unparseable."""
     try:
         dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -337,9 +318,7 @@ def _job_trigger_command(prompt: str, channel: str):
     # The prompt arrives as a user turn when the job fires, so mark it: it is the scheduler
     # nudging Max, not Apurva speaking.
     payload = shlex.quote(
-        json.dumps(
-            {"prompt": f"{SYSTEM_TRIGGER_PREFIX} {prompt}", "channel": channel}
-        )
+        json.dumps({"prompt": f"{SYSTEM_TRIGGER_PREFIX} {prompt}", "channel": channel})
     )
     return (
         f"curl -s -X POST {JOB_TRIGGER_URL} "
@@ -407,7 +386,6 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
 
 
 def _jobs_listing():
-    """The bare job list — the value of the {{JOBS}} persona variable."""
     jobs = _load_jobs()
     lines = []
     for job in jobs.get("cron", []):
@@ -426,10 +404,6 @@ def _jobs_listing():
 
 
 def _jobs_system_message():
-    """
-    Fallback wrapper for {{JOBS}} when SYSTEM.md doesn't place it. Active context is only today's
-    chat, so without this Max can't see reminders it set on an earlier day and creates duplicates.
-    """
     return {
         "role": "system",
         "content": (
@@ -446,7 +420,6 @@ SKILLS_DIR = "context/skills"
 
 
 def _parse_frontmatter(content):
-    """Extract `name`/`description` from a markdown file's leading YAML frontmatter, if present."""
     if not content.startswith("---"):
         return None, None
     end = content.find("\n---", 3)
@@ -467,13 +440,6 @@ def _parse_frontmatter(content):
 
 
 def _load_skills():
-    """
-    List available playbooks (context/skills/**.md) with their name/description parsed from
-    frontmatter. Walks the tree rather than listing one level: the web UI's Playbooks panel
-    walks it (webui._list_md_files), so a playbook saved into a subdirectory there would
-    otherwise be editable in the UI and invisible to the model. `filename` is the path
-    relative to SKILLS_DIR, which is how the UI addresses these files too.
-    """
     skills = []
     if not os.path.isdir(SKILLS_DIR):
         return skills
@@ -501,12 +467,6 @@ def _load_skills():
 
 
 def _load_context_files():
-    """
-    List the context files Max can read (context/**.md) with their name/description parsed from
-    frontmatter. Discovered by walking the tree, so a file added through the UI is visible on the
-    next turn without a code change. Skips context/skills/ (listed separately as playbooks) and
-    SYSTEM.md (this persona, already in context).
-    """
     files = []
     if not os.path.isdir(CONTEXT_DIR):
         return files
@@ -515,7 +475,9 @@ def _load_context_files():
         if rel_root == ".":
             dirs[:] = [d for d in dirs if d != "skills"]
         for filename in sorted(filenames):
-            if not filename.endswith(".md") or (rel_root == "." and filename == "SYSTEM.md"):
+            if not filename.endswith(".md") or (
+                rel_root == "." and filename == "SYSTEM.md"
+            ):
                 continue
             rel_path = filename if rel_root == "." else os.path.join(rel_root, filename)
             rel_path = rel_path.replace(os.sep, "/")
@@ -537,11 +499,6 @@ def _load_context_files():
 
 
 def _context_files_listing():
-    """
-    The context file tree — paths and one-line descriptions, not contents. The value of the
-    {{CONTEXT_FILES}} persona variable. The index is cheap enough to carry every turn; a file is
-    only worth reading in full once its description matches what's being asked.
-    """
     files = _load_context_files()
     if not files:
         return "There are currently no context files in context/."
@@ -550,7 +507,6 @@ def _context_files_listing():
 
 
 def _context_files_system_message():
-    """Fallback wrapper for {{CONTEXT_FILES}} when SYSTEM.md doesn't place it."""
     return {
         "role": "system",
         "content": (
@@ -565,10 +521,6 @@ def _context_files_system_message():
 
 
 def _skills_listing():
-    """
-    Available playbooks — name/description only, not contents. The value of the {{PLAYBOOKS}}
-    persona variable.
-    """
     skills = _load_skills()
     if not skills:
         return "There are currently no playbooks in context/skills/."
@@ -577,7 +529,6 @@ def _skills_listing():
 
 
 def _skills_system_message():
-    """Fallback wrapper for {{PLAYBOOKS}} when SYSTEM.md doesn't place it."""
     return {
         "role": "system",
         "content": (
@@ -600,7 +551,6 @@ PERSONA_VARIABLES = {
 
 
 def _render_persona():
-    """Expand any {{VARIABLE}} SYSTEM.md places; returns the text and which names it used."""
     persona = _load_persona() or ""
     inlined = set()
     for name, build in PERSONA_VARIABLES.items():
@@ -612,11 +562,6 @@ def _render_persona():
 
 
 def system_messages():
-    """
-    The system half of every turn: the rendered persona, plus a fallback block for each variable
-    SYSTEM.md didn't place itself. A variable inlined in the persona is *not* also appended —
-    that double-injection is exactly the redundancy the placeholders exist to remove.
-    """
     persona, inlined = _render_persona()
     messages = [{"role": "system", "content": persona}]
     fallbacks = {
@@ -645,9 +590,17 @@ TOOL_SCHEMAS = [
 ]
 
 
-async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = None):
-    model_key = model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
-    log.info("Generating reply (non-streaming, save_user_turn=%s, model=%s)", save_user_turn, model_key)
+async def _generate_reply(
+    user_input: str, save_user_turn: bool = True, model_key: str = None
+):
+    model_key = (
+        model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
+    )
+    log.info(
+        "Generating reply (non-streaming, save_user_turn=%s, model=%s)",
+        save_user_turn,
+        model_key,
+    )
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -658,7 +611,9 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     tool_calls_log = []
 
     while True:
-        response, model_key = await _complete_with_fallback(model_key, messages, TOOL_SCHEMAS)
+        response, model_key = await _complete_with_fallback(
+            model_key, messages, TOOL_SCHEMAS
+        )
         message = response.choices[0].message
         messages.append(
             {
@@ -727,8 +682,9 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
 
 
 async def _generate_reply_stream(user_input: str, model_key: str = None):
-    """Yield event dicts; the caller serializes them for the wire."""
-    model_key = model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
+    model_key = (
+        model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
+    )
     log.info("Chat request: %d chars (model=%s)", len(user_input), model_key)
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -742,7 +698,9 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
         tool_call_chunks = {}
         round_content = ""
         round_thinking = ""
-        async for resolved_key, chunk in _stream_with_fallback(model_key, messages, TOOL_SCHEMAS):
+        async for resolved_key, chunk in _stream_with_fallback(
+            model_key, messages, TOOL_SCHEMAS
+        ):
             model_key = resolved_key
             delta = chunk.choices[0].delta
             reasoning = getattr(delta, "reasoning", None)

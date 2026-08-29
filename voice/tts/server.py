@@ -32,7 +32,6 @@ _styles: dict[str, np.ndarray] = {}
 
 
 def _build_session() -> rt.InferenceSession:
-    """Build the ORT session ourselves — kokoro-onnx's create_session() sets no options at all."""
     options = rt.SessionOptions()
     options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
     options.intra_op_num_threads = INTRA_OP_THREADS

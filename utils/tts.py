@@ -27,7 +27,6 @@ _session = requests.Session()
 
 
 def synthesize(text: str, voice: str | None = None, speed: float = 1.0) -> bytes:
-    """Call the Kokoro TTS container and return WAV audio bytes."""
     response = _session.post(
         f"{TTS_SERVICE_URL}/synthesize",
         json={"text": text, "voice": voice or TTS_VOICE, "speed": speed},
@@ -39,10 +38,6 @@ def synthesize(text: str, voice: str | None = None, speed: float = 1.0) -> bytes
 
 @router.websocket("/tts/stream")
 async def stream_speak(websocket: WebSocket):
-    """
-    Persistent WS for the Voice toggle: the client pushes one {"text": ...} per sentence as
-    soon as it's segmented, so synthesis of the next overlaps playback of the current one.
-    """
     await websocket.accept()
     log.info("TTS stream connected")
     try:

@@ -45,7 +45,6 @@ app.mount("/static", StaticFiles(directory="web"), name="static")
 
 
 def _asset_version(path):
-    """mtime-based cache buster, so an edited css/js file is never served from cache."""
     try:
         return str(int(os.path.getmtime(path)))
     except OSError:

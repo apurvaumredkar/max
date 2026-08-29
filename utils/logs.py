@@ -22,11 +22,6 @@ BACKFILL_LINES = 200
 
 
 async def _journal_lines(request: Request, lines: int):
-    """
-    Yield SSE events from journalctl --follow, stopping when the client disconnects.
-
-    Backfills the last `lines` entries first so the tab isn't empty on open, then follows.
-    """
     process = await asyncio.create_subprocess_exec(
         "journalctl",
         "-u",

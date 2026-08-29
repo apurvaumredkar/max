@@ -127,13 +127,6 @@ def list_devices():
 
 
 def available_devices():
-    """
-    List the Spotify devices currently available to play on, e.g. to honour "play X on my iPad".
-
-    Each result has the device id, name, type, whether it is currently active, and whether it is
-    restricted (restricted devices cannot be controlled through the API). Match the user's wording
-    against the name/type, then pass that device's id to play_track.
-    """
     return [
         {
             "id": device.get("id"),
@@ -147,17 +140,6 @@ def available_devices():
 
 
 def transfer_playback(device_id):
-    """
-    Claim playback for the web player, but only if no other device already holds it.
-
-    A real device (phone, desktop app) takes priority: if one is active, leave it alone so
-    opening the page never yanks playback away from whatever Apurva is already using. Only
-    when nothing is active does the web player take over — and with play=False, so claiming
-    the device doesn't start music on its own.
-
-    Stale web-player devices from earlier page loads also report as "Max", so our own device
-    is identified by the device_id the SDK handed us, never by name.
-    """
     try:
         devices = list_devices()
     except Exception as e:
@@ -217,13 +199,6 @@ def previous_track():
 
 
 def search_track(query, limit=5):
-    """
-    Search Spotify for tracks matching a query.
-
-    Args:
-        query: Free-text search, e.g. "paper rings taylor swift".
-        limit: Maximum number of results to return.
-    """
     response = requests.get(
         SEARCH_URL,
         headers=_auth_headers(),
@@ -244,15 +219,6 @@ def search_track(query, limit=5):
 
 
 def play_track(uri, device_id=None):
-    """
-    Start playback of a specific track by its Spotify URI.
-
-    Args:
-        uri: The track's Spotify URI, e.g. "spotify:track:3JTLIzNfTYNPqOc7ZzrO4A" — get this
-            from search_track first if you only have a song name.
-        device_id: Optional device to play on, from available_devices. Omit to use whatever
-            device is currently active.
-    """
     response = requests.put(
         f"{PLAYER_URL}/play",
         headers=_auth_headers(),
@@ -264,15 +230,6 @@ def play_track(uri, device_id=None):
 
 
 def add_to_queue(uri, device_id=None):
-    """
-    Add a track to the end of the current playback queue.
-
-    Args:
-        uri: The track's Spotify URI, e.g. "spotify:track:3JTLIzNfTYNPqOc7ZzrO4A" — get this
-            from search_track first if you only have a song name.
-        device_id: Optional device whose queue to add to, from available_devices. Omit to use
-            whatever device is currently active.
-    """
     params = {"uri": uri}
     if device_id:
         params["device_id"] = device_id

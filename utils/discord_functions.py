@@ -63,7 +63,6 @@ def send_discord_message(channel: str, message: str):
 
 
 def _chunks(text, limit=DISCORD_MAX_CHARS):
-    """Split text into message-sized pieces, preferring line then word boundaries."""
     text = text.strip()
     while text:
         if len(text) <= limit:
@@ -79,7 +78,6 @@ def _chunks(text, limit=DISCORD_MAX_CHARS):
 
 
 def _as_subtext(chunk):
-    """Discord's `-#` subtext is per-line, so every line needs the marker."""
     return "\n".join(
         line if line.startswith("-# ") else f"-# {line}" for line in chunk.splitlines()
     )
@@ -98,7 +96,6 @@ async def _send(channel, text, subtext=False):
 
 
 async def _respond(message, generation):
-    """Relay one generation's events into the channel as they arrive."""
     from utils.webui import iter_events
 
     thinking = ""
@@ -156,7 +153,6 @@ class _MaxClient(discord.Client):
 
 
 def start_bot():
-    """Launch the gateway alongside the API; returns the task, or None if unconfigured."""
     if not DISCORD_BOT_TOKEN:
         log.warning("DISCORD_BOT_TOKEN not set — Discord bot not started")
         return None
