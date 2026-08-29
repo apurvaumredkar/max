@@ -231,7 +231,17 @@ def _model_fallback_candidates(preferred_key):
     Ollama) doesn't fail the whole turn when another configured model could serve it.
     """
     ordered = [preferred_key] if preferred_key in MODEL_OPTIONS else []
-    ordered += [key for key in MODEL_OPTIONS if key not in ordered]
+    # Only the hand-declared entries and the Tailscale Ollama hosts are fallback candidates.
+    # The discovered OpenRouter catalog is ~400 models and only a handful are :free, so
+    # walking it meant a single rate-limited free-tier failure — the *normal* failure here —
+    # could silently land the turn on a billed model, and _remember_model_key would then
+    # persist it as the default for every later request, scheduled jobs included. It also
+    # made a total outage take hundreds of sequential API calls to give up on.
+    ordered += [
+        key
+        for key in MODEL_OPTIONS
+        if key not in ordered and not key.startswith("openrouter:")
+    ]
     return ordered
 
 
