@@ -2,7 +2,6 @@ from ollama._utils import convert_function_to_tool
 import os
 import subprocess
 import shlex
-from dotenv import load_dotenv
 from datetime import datetime
 import json
 import uuid
@@ -19,8 +18,6 @@ from utils.inference import (
     get_default_model_key,
 )
 from utils.logging_config import get_logger
-
-load_dotenv("secrets/.env")
 
 log = get_logger(__name__)
 
@@ -631,16 +628,6 @@ def system_messages():
         if name not in inlined:
             messages.append(build())
     return messages
-
-
-def sync_crontab_on_startup():
-    """
-    Bring the crontab in line with jobs.json at boot.
-
-    Historically jobs were appended to the crontab and never removed, so the two drifted.
-    Syncing here means a deleted job's cron line can't outlive it.
-    """
-    return _sync_crontab()
 
 
 AVAILABLE_TOOLS = {

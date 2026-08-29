@@ -28,7 +28,6 @@ from utils.agent import (
     _load_all_history,
     _load_history,
     _load_jobs,
-    _load_persona,
     _save_jobs,
     _skills_system_message,
     _sync_crontab,
@@ -42,40 +41,6 @@ router = APIRouter()
 
 
 # --- Chat history ---
-
-
-def backfill_turn_ids():
-    """
-    Give any pre-existing turn an id, rewriting the file in place.
-
-    Turns written before ids existed can't be addressed for deletion, so stamp them once
-    on startup. Returns the number of turns updated.
-    """
-    if not os.path.isdir("chats"):
-        return 0
-    updated = 0
-    for filename in sorted(os.listdir("chats")):
-        if not filename.endswith(".jsonl"):
-            continue
-        path = f"chats/{filename}"
-        try:
-            with open(path, "r") as chats:
-                turns = [json.loads(line) for line in chats if line.strip()]
-        except Exception as e:
-            log.error("Failed to read %s for id backfill: %s", path, e)
-            continue
-        missing = [turn for turn in turns if not turn.get("id")]
-        if not missing:
-            continue
-        for turn in missing:
-            turn["id"] = uuid.uuid4().hex
-        try:
-            _rewrite_turns(path, turns)
-            updated += len(missing)
-            log.info("Backfilled %d turn ids in %s", len(missing), path)
-        except Exception as e:
-            log.error("Failed to backfill ids in %s: %s", path, e)
-    return updated
 
 
 def _rewrite_turns(path, turns):
@@ -132,21 +97,6 @@ async def delete_history_turn(turn_id: str):
 
 
 # --- Jobs CRUD ---
-
-
-def backfill_job_ids():
-    """Stamp ids on jobs written before ids existed, so the UI can address them."""
-    jobs = _load_jobs()
-    updated = 0
-    for kind in ("cron", "scheduled"):
-        for job in jobs.get(kind, []):
-            if not job.get("id"):
-                job["id"] = uuid.uuid4().hex
-                updated += 1
-    if updated:
-        _save_jobs(jobs)
-        log.info("Backfilled %d job id(s)", updated)
-    return updated
 
 
 def _find_job(jobs, job_id):

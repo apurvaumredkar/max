@@ -15,9 +15,10 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Max agent started")
-    webui.backfill_turn_ids()
-    webui.backfill_job_ids()
-    agent.sync_crontab_on_startup()
+    try:
+        agent._sync_crontab()
+    except Exception:
+        log.exception("Crontab sync failed at startup; continuing without it")
     discord_task = discord_functions.start_bot()
     yield
     if discord_task:

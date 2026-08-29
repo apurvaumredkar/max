@@ -79,58 +79,8 @@ body > .app-layout {
 }
 
 .jobs-header,
-.job-form,
-.jobs-container h3 {
+.job-form {
     flex-shrink: 0;
-}
-
-.container::-webkit-scrollbar,
-.jobs-container::-webkit-scrollbar,
-.messages::-webkit-scrollbar,
-.scheduled-jobs::-webkit-scrollbar,
-.cron-jobs::-webkit-scrollbar,
-.context-file-list::-webkit-scrollbar,
-.skill-file-list::-webkit-scrollbar,
-.editor-textarea::-webkit-scrollbar,
-.editor-preview::-webkit-scrollbar {
-    width: 8px;
-}
-
-.container::-webkit-scrollbar-track,
-.jobs-container::-webkit-scrollbar-track,
-.messages::-webkit-scrollbar-track,
-.scheduled-jobs::-webkit-scrollbar-track,
-.cron-jobs::-webkit-scrollbar-track,
-.context-file-list::-webkit-scrollbar-track,
-.skill-file-list::-webkit-scrollbar-track,
-.editor-textarea::-webkit-scrollbar-track,
-.editor-preview::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.container::-webkit-scrollbar-thumb,
-.jobs-container::-webkit-scrollbar-thumb,
-.messages::-webkit-scrollbar-thumb,
-.scheduled-jobs::-webkit-scrollbar-thumb,
-.cron-jobs::-webkit-scrollbar-thumb,
-.context-file-list::-webkit-scrollbar-thumb,
-.skill-file-list::-webkit-scrollbar-thumb,
-.editor-textarea::-webkit-scrollbar-thumb,
-.editor-preview::-webkit-scrollbar-thumb {
-    background-color: #404040;
-    border-radius: 4px;
-}
-
-.container::-webkit-scrollbar-thumb:hover,
-.jobs-container::-webkit-scrollbar-thumb:hover,
-.messages::-webkit-scrollbar-thumb:hover,
-.scheduled-jobs::-webkit-scrollbar-thumb:hover,
-.cron-jobs::-webkit-scrollbar-thumb:hover,
-.context-file-list::-webkit-scrollbar-thumb:hover,
-.skill-file-list::-webkit-scrollbar-thumb:hover,
-.editor-textarea::-webkit-scrollbar-thumb:hover,
-.editor-preview::-webkit-scrollbar-thumb:hover {
-    background-color: #555555;
 }
 
 pre {
@@ -365,25 +315,6 @@ pre {
 
 .file-folder-label:first-child {
     margin-top: 0;
-}
-
-.context-file-edit {
-    background: none;
-    border: 1px solid #404040;
-    border-radius: 50px;
-    color: #999999;
-    font-family: inherit;
-    font-size: 10px;
-    line-height: 1;
-    padding: 3px 7px;
-    cursor: pointer;
-    flex-shrink: 0;
-    margin-left: 8px;
-}
-
-.context-file-edit:hover {
-    color: #ffffff;
-    border-color: #555555;
 }
 
 .context-empty,
@@ -788,14 +719,6 @@ pre {
 .jobs-container h2 {
     margin: 0 0 16px 0;
     font-size: 18px;
-}
-
-.jobs-container h3 {
-    margin: 20px 0 10px 0;
-    font-size: 14px;
-    color: #888888;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
 }
 
 .job {
@@ -1545,20 +1468,6 @@ pre.code-block code {
     scrollbar-color: #404040 transparent;
 }
 
-.logs-output::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-}
-
-.logs-output::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.logs-output::-webkit-scrollbar-thumb {
-    background-color: #404040;
-    border-radius: 4px;
-}
-
 .log-line {
     white-space: pre;
     color: #c8c8c8;
@@ -1578,11 +1487,6 @@ pre.code-block code {
 
 .log-line.level-debug {
     color: #777777;
-}
-
-.logs-empty {
-    color: #666666;
-    font-style: italic;
 }
 
 /* --- Per-message delete --- */
