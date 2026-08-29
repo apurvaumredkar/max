@@ -756,7 +756,17 @@ document.addEventListener('DOMContentLoaded', () => {
                         collapseReasoning(messageEl);
                         messageEl.querySelector('.timestamp').textContent = event.turn.timestamp;
                         if (event.turn.id) messageEl.dataset.turnId = event.turn.id;
-                        loadContextUsage();
+                        // The server may have fallen back to a different model mid-turn. The
+                        // picker is pinned in localStorage, so resync it — otherwise it keeps
+                        // naming a model that isn't answering and sizes the context meter to
+                        // that model's window. Skip if the key isn't in the current options
+                        // (a host that dropped out of /max/models), which would blank the label.
+                        if (event.model && event.model !== selectedModelKey
+                            && modelOptions.some((o) => o.key === event.model)) {
+                            selectModel(event.model);  // also refreshes context usage
+                        } else {
+                            loadContextUsage();
+                        }
                         if (voiceEnabled()) {
                             const finalText = (pendingSpeech ? pendingSpeech + ' ' : '') + speechBuffer;
                             if (finalText.trim()) enqueueSpeech(finalText);

@@ -33,6 +33,10 @@ load_dotenv("secrets/.env")
 
 log = get_logger(__name__)
 
+# No Spotify call may block forever: this module runs in the same process as the agent
+# loop, and an unanswered socket used to stall chat, TTS and the Discord gateway with it.
+SPOTIFY_TIMEOUT = 10
+
 router = APIRouter()
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -56,6 +60,9 @@ def get_authorize_url():
     return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
 
+_token_cache = {"access_token": None, "expires_at": 0}
+
+
 def exchange_code_for_token(code):
     credentials = base64.b64encode(
         f"{os.getenv('SPOTIFY_CLIENT_ID')}:{os.getenv('SPOTIFY_CLIENT_SECRET')}".encode()
@@ -68,8 +75,13 @@ def exchange_code_for_token(code):
             "code": code,
             "redirect_uri": REDIRECT_URI,
         },
+        timeout=SPOTIFY_TIMEOUT,
     )
     response.raise_for_status()
+    # Re-authenticating must invalidate the cached access token. Without this, get_access_token
+    # keeps serving the pre-auth token until it expires — so the re-auth you just did to fix a
+    # bad grant appears to do nothing for up to an hour.
+    _token_cache["expires_at"] = 0
     refresh_token = response.json()["refresh_token"]
     set_key("secrets/.env", "SPOTIFY_REFRESH_TOKEN", refresh_token)
     os.environ["SPOTIFY_REFRESH_TOKEN"] = refresh_token
@@ -80,7 +92,6 @@ def exchange_code_for_token(code):
 # re-running the refresh-token exchange (a round trip to Spotify's auth server) on every
 # poll was the actual source of the card's lag. Access tokens are valid ~1hr; refresh
 # a bit early to stay clear of the exact expiry edge.
-_token_cache = {"access_token": None, "expires_at": 0}
 
 
 def get_access_token():
@@ -96,6 +107,7 @@ def get_access_token():
             "grant_type": "refresh_token",
             "refresh_token": os.getenv("SPOTIFY_REFRESH_TOKEN"),
         },
+        timeout=SPOTIFY_TIMEOUT,
     )
     response.raise_for_status()
     data = response.json()
@@ -109,7 +121,7 @@ def _auth_headers():
 
 
 def list_devices():
-    response = requests.get(f"{PLAYER_URL}/devices", headers=_auth_headers())
+    response = requests.get(f"{PLAYER_URL}/devices", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     response.raise_for_status()
     return response.json().get("devices", [])
 
@@ -173,6 +185,7 @@ def transfer_playback(device_id):
         PLAYER_URL,
         headers=_auth_headers(),
         json={"device_ids": [device_id], "play": False},
+        timeout=SPOTIFY_TIMEOUT,
     )
     if response.status_code >= 400:
         log.error(
@@ -184,22 +197,22 @@ def transfer_playback(device_id):
 
 
 def resume():
-    response = requests.put(f"{PLAYER_URL}/play", headers=_auth_headers())
+    response = requests.put(f"{PLAYER_URL}/play", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     return {"status_code": response.status_code}
 
 
 def pause():
-    response = requests.put(f"{PLAYER_URL}/pause", headers=_auth_headers())
+    response = requests.put(f"{PLAYER_URL}/pause", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     return {"status_code": response.status_code}
 
 
 def next_track():
-    response = requests.post(f"{PLAYER_URL}/next", headers=_auth_headers())
+    response = requests.post(f"{PLAYER_URL}/next", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     return {"status_code": response.status_code}
 
 
 def previous_track():
-    response = requests.post(f"{PLAYER_URL}/previous", headers=_auth_headers())
+    response = requests.post(f"{PLAYER_URL}/previous", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     return {"status_code": response.status_code}
 
 
@@ -215,6 +228,7 @@ def search_track(query, limit=5):
         SEARCH_URL,
         headers=_auth_headers(),
         params={"q": query, "type": "track", "limit": limit},
+        timeout=SPOTIFY_TIMEOUT,
     )
     response.raise_for_status()
     tracks = response.json().get("tracks", {}).get("items", [])
@@ -244,6 +258,7 @@ def play_track(uri, device_id=None):
         headers=_auth_headers(),
         params={"device_id": device_id} if device_id else None,
         json={"uris": [uri]},
+        timeout=SPOTIFY_TIMEOUT,
     )
     return {"status_code": response.status_code}
 
@@ -265,12 +280,13 @@ def add_to_queue(uri, device_id=None):
         f"{PLAYER_URL}/queue",
         headers=_auth_headers(),
         params=params,
+        timeout=SPOTIFY_TIMEOUT,
     )
     return {"status_code": response.status_code}
 
 
 def now_playing():
-    response = requests.get(f"{PLAYER_URL}/currently-playing", headers=_auth_headers())
+    response = requests.get(f"{PLAYER_URL}/currently-playing", headers=_auth_headers(), timeout=SPOTIFY_TIMEOUT)
     if response.status_code == 204 or not response.content:
         return {"is_playing": False, "track": None}
     response.raise_for_status()
@@ -287,7 +303,7 @@ def now_playing():
 
 
 @router.get("/spotify/now-playing")
-async def route_now_playing():
+def route_now_playing():
     try:
         return now_playing()
     except Exception as e:
@@ -296,37 +312,37 @@ async def route_now_playing():
 
 
 @router.post("/spotify/resume")
-async def route_resume():
+def route_resume():
     return resume()
 
 
 @router.post("/spotify/pause")
-async def route_pause():
+def route_pause():
     return pause()
 
 
 @router.post("/spotify/next")
-async def route_next():
+def route_next():
     return next_track()
 
 
 @router.post("/spotify/prev")
-async def route_prev():
+def route_prev():
     return previous_track()
 
 
 @router.get("/spotify/authenticate")
-async def route_authenticate():
+def route_authenticate():
     return RedirectResponse(get_authorize_url())
 
 
 @router.get("/spotify/token")
-async def route_token():
+def route_token():
     return {"access_token": get_access_token()}
 
 
 @router.post("/spotify/transfer")
-async def route_transfer(device_id: str = Body(embed=True)):
+def route_transfer(device_id: str = Body(embed=True)):
     return transfer_playback(device_id)
 
 

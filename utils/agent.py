@@ -1,16 +1,23 @@
-from ollama import Client
 from ollama._utils import convert_function_to_tool
-from openai import AsyncOpenAI
 import os
 import subprocess
 import shlex
-import requests
 from dotenv import load_dotenv
 from datetime import datetime
 import json
 import uuid
 from fastapi import APIRouter, Body
+from utils import inference
 from utils.discord_functions import send_discord_message
+# MODEL_OPTIONS is deliberately *not* imported by name — refresh_model_options() rebinds it, and
+# a from-import here would freeze the startup snapshot. Reach it as inference.MODEL_OPTIONS.
+from utils.inference import (
+    EMBED_MODEL,
+    _complete_with_fallback,
+    _stream_with_fallback,
+    embed_client,
+    get_default_model_key,
+)
 from utils.logging_config import get_logger
 
 load_dotenv("secrets/.env")
@@ -19,299 +26,6 @@ log = get_logger(__name__)
 
 JOB_TRIGGER_URL = "http://localhost/max/job-trigger"
 
-# Selectable inference backends — the UI's model selector picks a key from here per request.
-# Each is an OpenAI-compatible endpoint; base_url/api_key come from secrets/.env so credentials
-# stay out of source. The Ollama host's own entries are discovered dynamically (see
-# discover_ollama_models below) rather than hardcoded, so newly pulled models show up without
-# a code change.
-STATIC_MODEL_OPTIONS = {
-    "openrouter-nemotron": {
-        "label": "OpenRouter · Nemotron 3 Ultra",
-        "group": "OpenRouter",
-        "model_label": "Nemotron 3 Ultra",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "base_url": os.getenv("INFERENCE_HOST_URL"),
-        "api_key": os.getenv("INFERENCE_API_KEY"),
-        # The :free tier's context window (the paid tier is capped at 512,288).
-        "context_length": 1_000_000,
-    },
-}
-DEFAULT_MODEL_KEY = "openrouter-nemotron"
-
-# Default when OpenRouter's /models doesn't report a context length for some entry.
-_OPENROUTER_DEFAULT_CONTEXT_LENGTH = 8192
-
-
-def discover_openrouter_models():
-    """
-    Query OpenRouter's /models endpoint for the full catalog, so the picker offers every model
-    available there instead of just the hardcoded Nemotron entry. The Nemotron model id itself is
-    skipped since STATIC_MODEL_OPTIONS already covers it (and must, so a picker default survives
-    even if this request fails). Unreachable/errors are logged and skipped — the static entry
-    still works.
-    """
-    base_url = os.getenv("INFERENCE_HOST_URL")
-    api_key = os.getenv("INFERENCE_API_KEY")
-    if not base_url:
-        return {}
-    static_model_id = STATIC_MODEL_OPTIONS["openrouter-nemotron"]["model"]
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    options = {}
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=10)
-        response.raise_for_status()
-        models = response.json().get("data", [])
-    except Exception as e:
-        log.error("Failed to list OpenRouter models from %s: %s", base_url, e)
-        return options
-
-    for entry in models:
-        model_id = entry.get("id")
-        if not model_id or model_id == static_model_id:
-            continue
-        name = entry.get("name") or model_id
-        options[f"openrouter:{model_id}"] = {
-            "label": f"OpenRouter · {name}",
-            "group": "OpenRouter",
-            "model_label": name,
-            "model": model_id,
-            "base_url": base_url,
-            "api_key": api_key,
-            "context_length": entry.get("context_length") or _OPENROUTER_DEFAULT_CONTEXT_LENGTH,
-        }
-    return options
-
-# Two Tailscale-reachable Ollama hosts, keyed by provider id. "work" needs no API key —
-# it's plain `ollama serve` reached over Tailscale's own network-level security.
-TAILSCALE_OLLAMA_PROVIDERS = {
-    "home": {
-        "label": "Home",
-        "host_url": os.getenv("TAILSCALE_OLLAMA_HOME_HOST_URL"),
-        "api_key": os.getenv("TAILSCALE_OLLAMA_HOME_API_KEY"),
-    },
-    "work": {
-        "label": "Work (MacBook Pro)",
-        "host_url": os.getenv("TAILSCALE_OLLAMA_WORK_HOST_URL"),
-        "api_key": os.getenv("TAILSCALE_OLLAMA_WORK_API_KEY"),
-    },
-}
-
-# Default when Ollama's /api/tags doesn't report a model's context length (some families omit it).
-_OLLAMA_DEFAULT_CONTEXT_LENGTH = 8192
-
-
-def _ollama_model_context_length(host, headers, name, fallback):
-    """
-    /api/tags's details.context_length is only populated for a handful of custom models
-    (ones whose Modelfile sets it explicitly) — most models, including every one on the
-    work MacBook (MLX/safetensors format), omit it there entirely. /api/show's model_info
-    always has it, keyed as "<architecture>.context_length" (e.g. "gemma4.context_length"),
-    so that's the reliable source; /api/tags's field (when present) only saves this call.
-    """
-    try:
-        response = requests.post(f"{host}/api/show", headers=headers, json={"model": name}, timeout=5)
-        response.raise_for_status()
-        model_info = response.json().get("model_info", {})
-        for key, value in model_info.items():
-            if key.endswith(".context_length"):
-                return value
-    except Exception as e:
-        log.error("Failed to fetch context length for %s from %s: %s", name, host, e)
-    return fallback
-
-
-def discover_ollama_models():
-    """
-    Query each Tailscale Ollama host's native API (not the OpenAI-compatible /v1 route it's
-    otherwise used through) for every model currently pulled there, so the model picker always
-    reflects what's actually available instead of a hardcoded model name. A provider that's
-    unreachable is logged and skipped — the static options and the other provider still work.
-    """
-    options = {}
-    for provider_id, provider in TAILSCALE_OLLAMA_PROVIDERS.items():
-        host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
-        if not host:
-            continue
-        headers = {"Authorization": f"Bearer {provider['api_key']}"} if provider["api_key"] else {}
-        try:
-            response = requests.get(f"{host}/api/tags", headers=headers, timeout=5)
-            response.raise_for_status()
-            models = response.json().get("models", [])
-        except Exception as e:
-            log.error("Failed to list Ollama models from %s (%s): %s", host, provider_id, e)
-            continue
-
-        for entry in models:
-            name = entry.get("model") or entry.get("name")
-            if not name:
-                continue
-            fallback = entry.get("details", {}).get("context_length") or _OLLAMA_DEFAULT_CONTEXT_LENGTH
-            options[f"tailscale-ollama-{provider_id}:{name}"] = {
-                "label": f"Ollama · {provider['label']} · {name}",
-                "group": provider["label"],
-                "model_label": name,
-                "model": name,
-                "base_url": provider["host_url"],
-                "api_key": provider["api_key"],
-                "context_length": _ollama_model_context_length(host, headers, name, fallback),
-            }
-    return options
-
-
-MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
-
-
-def refresh_model_options():
-    """Re-query the Ollama hosts and OpenRouter so newly available models show up without a restart."""
-    global MODEL_OPTIONS
-    MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
-    return MODEL_OPTIONS
-
-
-def _model_choice(model_key):
-    """Resolve a UI model key to a client + model id + context window, falling back to the default."""
-    key = model_key if model_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
-    opts = MODEL_OPTIONS[key]
-    # AsyncOpenAI's own validation rejects a falsy api_key outright (it doesn't just get sent
-    # and ignored) — a provider like the work MacBook's plain `ollama serve`, with no auth at
-    # all, still needs some non-empty placeholder to satisfy the client constructor.
-    client = AsyncOpenAI(base_url=opts["base_url"], api_key=opts["api_key"] or "ollama")
-    return client, opts["model"], opts["context_length"]
-
-
-CONFIG_PATH = "context/config.json"
-
-
-def _load_config():
-    """Small persisted runtime config (currently just the last model used). {} if missing/invalid."""
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_config(config):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-
-def get_default_model_key():
-    """
-    The model key to use when a request doesn't name one: whatever last successfully generated
-    a reply (persisted in context/config.json), so the picker — and scheduled jobs, which have
-    no UI to pick from — pick up where the user left off instead of always landing back on
-    DEFAULT_MODEL_KEY.
-    """
-    last_key = _load_config().get("last_model_key")
-    return last_key if last_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
-
-
-def _remember_model_key(model_key):
-    """Persist the model that just successfully generated a reply as the new default."""
-    config = _load_config()
-    if config.get("last_model_key") == model_key:
-        return
-    config["last_model_key"] = model_key
-    _save_config(config)
-
-
-def _model_fallback_candidates(preferred_key):
-    """
-    Ordered model keys to try: the requested one first, then every other configured model —
-    so a dead client (bad credentials, host unreachable, rate limited, model removed from
-    Ollama) doesn't fail the whole turn when another configured model could serve it.
-    """
-    ordered = [preferred_key] if preferred_key in MODEL_OPTIONS else []
-    ordered += [key for key in MODEL_OPTIONS if key not in ordered]
-    return ordered
-
-
-async def _complete_with_fallback(model_key, messages):
-    """
-    Call the chat-completions endpoint for model_key; on failure, retry with the next
-    configured model instead of failing the turn. Returns (response, resolved_model_key) —
-    resolved_model_key may differ from model_key if a fallback was needed, and becomes the
-    new remembered default on success.
-    """
-    candidates = _model_fallback_candidates(model_key)
-    last_error = None
-    for i, candidate_key in enumerate(candidates):
-        client, model_name, context_length = _model_choice(candidate_key)
-        try:
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
-            )
-        except Exception as e:
-            last_error = e
-            log.error(
-                "Model %s failed (%s: %s)%s",
-                candidate_key,
-                type(e).__name__,
-                e,
-                "" if i + 1 == len(candidates) else " — falling back to next model",
-            )
-            continue
-        if candidate_key != model_key:
-            log.warning("Fell back from model %s to %s", model_key, candidate_key)
-        _remember_model_key(candidate_key)
-        return response, candidate_key
-    raise last_error
-
-
-async def _stream_with_fallback(model_key, messages):
-    """
-    Streaming counterpart to _complete_with_fallback. Only falls back if the failure happens
-    before any chunk of this round has been produced — a stream that dies partway through
-    can't be safely resumed on a different model without duplicating or losing output already
-    sent to the client. Yields (resolved_model_key, chunk) pairs; resolved_model_key is stable
-    across a round's yields and becomes the new remembered default on success.
-    """
-    candidates = _model_fallback_candidates(model_key)
-    last_error = None
-    for i, candidate_key in enumerate(candidates):
-        client, model_name, context_length = _model_choice(candidate_key)
-        try:
-            stream = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                stream=True,
-                extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
-            )
-            aiter = stream.__aiter__()
-            try:
-                first_chunk = await aiter.__anext__()
-            except StopAsyncIteration:
-                if candidate_key != model_key:
-                    log.warning("Fell back from model %s to %s", model_key, candidate_key)
-                _remember_model_key(candidate_key)
-                return
-        except Exception as e:
-            last_error = e
-            log.error(
-                "Model %s failed to start a response (%s: %s)%s",
-                candidate_key,
-                type(e).__name__,
-                e,
-                "" if i + 1 == len(candidates) else " — falling back to next model",
-            )
-            continue
-        if candidate_key != model_key:
-            log.warning("Fell back from model %s to %s", model_key, candidate_key)
-        _remember_model_key(candidate_key)
-        yield candidate_key, first_chunk
-        async for chunk in aiter:
-            yield candidate_key, chunk
-        return
-    raise last_error
-
-
-embed_client = Client(host="http://localhost:11434")
-EMBED_MODEL = "all-minilm"
 
 router = APIRouter()
 
@@ -325,23 +39,19 @@ def _load_persona():
 
 
 def _load_history():
-    d = datetime.today().strftime("%Y%m%d")
-    filename = f"chats/{d}.jsonl"
-    if not os.path.exists(filename):
-        try:
-            flags = os.O_CREAT | os.O_RDWR
-            fd = os.open(filename, flags)
-            os.close(fd)
-        except Exception as e:
-            log.error("Failed to create chat log %s: %s", filename, e)
-    else:
-        try:
-            with open(filename, "r") as chats:
-                turns = [json.loads(i) for i in chats.readlines()]
-                return [turn for turn in turns if turn.get("source") != "job"]
-        except Exception as e:
-            log.error("Failed to read today's history %s: %s", filename, e)
-    return []
+    # Blank lines are skipped rather than parsed: a single trailing newline (a hand-edited
+    # file, a partial write) used to raise JSONDecodeError here and silently return [] —
+    # losing the whole day's context with nothing but a log line to show for it.
+    filename = f"chats/{datetime.today().strftime('%Y%m%d')}.jsonl"
+    try:
+        with open(filename, "r") as chats:
+            turns = [json.loads(line) for line in chats if line.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.error("Failed to read today's history %s: %s", filename, e)
+        return []
+    return [turn for turn in turns if turn.get("source") != "job"]
 
 
 def _load_all_history(exclude_files=()):
@@ -353,7 +63,7 @@ def _load_all_history(exclude_files=()):
             continue
         try:
             with open(f"chats/{filename}", "r") as chats:
-                turns.extend(json.loads(line) for line in chats.readlines())
+                turns.extend(json.loads(line) for line in chats if line.strip())
         except Exception as e:
             log.error("Failed to read history file chats/%s: %s", filename, e)
     return turns
@@ -760,26 +470,37 @@ def _parse_frontmatter(content):
 
 
 def _load_skills():
-    """List available playbooks (context/skills/*.md) with their name/description parsed
-    from frontmatter."""
+    """
+    List available playbooks (context/skills/**.md) with their name/description parsed from
+    frontmatter. Walks the tree rather than listing one level: the web UI's Playbooks panel
+    walks it (webui._list_md_files), so a playbook saved into a subdirectory there would
+    otherwise be editable in the UI and invisible to the model. `filename` is the path
+    relative to SKILLS_DIR, which is how the UI addresses these files too.
+    """
     skills = []
     if not os.path.isdir(SKILLS_DIR):
         return skills
-    for filename in sorted(os.listdir(SKILLS_DIR)):
-        if not filename.endswith(".md"):
-            continue
-        path = os.path.join(SKILLS_DIR, filename)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            log.error("Failed to read skill file %s: %s", path, e)
-            continue
-        name, description = _parse_frontmatter(content)
-        skills.append(
-            {"filename": filename, "name": name or filename[:-3], "description": description or ""}
-        )
-    return skills
+    for root, _dirs, filenames in os.walk(SKILLS_DIR):
+        for filename in sorted(filenames):
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.join(root, filename)
+            rel_path = os.path.relpath(path, SKILLS_DIR).replace(os.sep, "/")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                log.error("Failed to read skill file %s: %s", path, e)
+                continue
+            name, description = _parse_frontmatter(content)
+            skills.append(
+                {
+                    "filename": rel_path,
+                    "name": name or rel_path[:-3],
+                    "description": description or "",
+                }
+            )
+    return sorted(skills, key=lambda s: s["filename"])
 
 
 def _load_context_files():
@@ -938,7 +659,7 @@ TOOL_SCHEMAS = [
 
 
 async def _generate_reply(user_input: str, save_user_turn: bool = True, model_key: str = None):
-    model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
+    model_key = model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
     log.info("Generating reply (non-streaming, save_user_turn=%s, model=%s)", save_user_turn, model_key)
     if save_user_turn:
         _save_turn({"role": "user", "content": user_input})
@@ -950,7 +671,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     tool_calls_log = []
 
     while True:
-        response, model_key = await _complete_with_fallback(model_key, messages)
+        response, model_key = await _complete_with_fallback(model_key, messages, TOOL_SCHEMAS)
         message = response.choices[0].message
         messages.append(
             {
@@ -978,11 +699,15 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
         if not message.tool_calls:
             break
         for tool_call in message.tool_calls:
-            function_to_call = AVAILABLE_TOOLS[tool_call.function.name]
-            arguments = json.loads(tool_call.function.arguments)
-            log.info("Tool call: %s(%s)", tool_call.function.name, arguments)
+            # Lookup and arg-parsing sit inside the try on purpose: a hallucinated tool name
+            # (KeyError) and truncated/malformed arguments (JSONDecodeError) are routine with
+            # small local models, and outside the try they'd kill the whole generation instead
+            # of being handed back to the model as a tool error it can recover from.
+            arguments = {}
             try:
-                output = function_to_call(**arguments)
+                arguments = json.loads(tool_call.function.arguments or "{}")
+                log.info("Tool call: %s(%s)", tool_call.function.name, arguments)
+                output = AVAILABLE_TOOLS[tool_call.function.name](**arguments)
             except Exception as e:
                 log.exception("Tool %s failed", tool_call.function.name)
                 output = {"error": f"{type(e).__name__}: {e}"}
@@ -1004,7 +729,9 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
     return _save_turn(
         {
             "role": "assistant",
-            "content": message.content,
+            # `or ""` matters: message.content is None when the final round is tool-calls
+            # only, and send_discord_message would POST {"content": null} → HTTP 400.
+            "content": message.content or "",
             "thinking": getattr(message, "reasoning", None),
             "tool_calls": tool_calls_log,
             "source": "job",
@@ -1014,7 +741,7 @@ async def _generate_reply(user_input: str, save_user_turn: bool = True, model_ke
 
 async def _generate_reply_stream(user_input: str, model_key: str = None):
     """Yield event dicts; the caller serializes them for the wire."""
-    model_key = model_key if model_key in MODEL_OPTIONS else get_default_model_key()
+    model_key = model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
     log.info("Chat request: %d chars (model=%s)", len(user_input), model_key)
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
@@ -1028,7 +755,7 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
         tool_call_chunks = {}
         round_content = ""
         round_thinking = ""
-        async for resolved_key, chunk in _stream_with_fallback(model_key, messages):
+        async for resolved_key, chunk in _stream_with_fallback(model_key, messages, TOOL_SCHEMAS):
             model_key = resolved_key
             delta = chunk.choices[0].delta
             reasoning = getattr(delta, "reasoning", None)
@@ -1083,11 +810,14 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
         if not tool_calls:
             break
         for tc in tool_calls:
-            function_to_call = AVAILABLE_TOOLS[tc["name"]]
-            arguments = json.loads(tc["arguments"])
-            log.info("Tool call: %s(%s)", tc["name"], arguments)
+            # Inside the try for the same reason as the non-streaming loop above — an unknown
+            # tool name or unparseable arguments must reach the model as an error, not kill
+            # the detached generation task mid-reply.
+            arguments = {}
             try:
-                output = function_to_call(**arguments)
+                arguments = json.loads(tc["arguments"] or "{}")
+                log.info("Tool call: %s(%s)", tc["name"], arguments)
+                output = AVAILABLE_TOOLS[tc["name"]](**arguments)
             except Exception as e:
                 log.exception("Tool %s failed", tc["name"])
                 output = {"error": f"{type(e).__name__}: {e}"}
@@ -1114,7 +844,10 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
             "tool_calls": tool_calls_log,
         }
     )
-    yield {"type": "done", "turn": turn}
+    # model_key is whatever _stream_with_fallback last resolved to, which may not be what the
+    # caller asked for. The client pins its picker in localStorage, so without this it keeps
+    # showing (and sizing its context meter against) a model that isn't answering any more.
+    yield {"type": "done", "turn": turn, "model": model_key}
 
 
 @router.post("/job-trigger")

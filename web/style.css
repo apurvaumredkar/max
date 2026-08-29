@@ -654,6 +654,10 @@ pre {
 }
 
 .spotify-container {
+    /* Positioning context for .spotify-menu-button / .spotify-menu, which are absolute.
+       Without it they resolved against the viewport and only looked right because this
+       card happens to sit bottom-right. */
+    position: relative;
     /* Original width, independent of the jobs card above it. */
     width: 294px;
     flex-shrink: 0;

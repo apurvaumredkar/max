@@ -5,7 +5,8 @@ Everything here exists purely to support the browser UI — jobs CRUD, context-f
 chat history, model listing, the context-usage estimator, and the streaming-chat
 reattach/replay machinery. None of it is invoked by the LLM's tool-calling loop; that lives
 in utils/agent.py, which this module imports from for the handful of things (job storage,
-crontab sync, model config, persona/history loading) that both sides need.
+crontab sync, persona/history loading) that both sides need. Model/backend config comes from
+utils/inference.py directly.
 """
 
 import asyncio
@@ -19,7 +20,7 @@ import requests
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 
-from utils import agent
+from utils import agent, inference
 from utils.agent import (
     TOOL_SCHEMAS,
     _generate_reply_stream,
@@ -31,8 +32,8 @@ from utils.agent import (
     _save_jobs,
     _skills_system_message,
     _sync_crontab,
-    get_default_model_key,
 )
+from utils.inference import get_default_model_key
 from utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -364,9 +365,14 @@ async def save_skill_file(filename: str, payload: dict = Body(...)):
 # --- Model / context info ---
 
 
+# NOTE: the three handlers below are deliberately `def`, not `async def`. Each does blocking
+# I/O (requests to Tailscale Ollama hosts / OpenRouter, or a full walk of context/ + chats/).
+# FastAPI runs a plain `def` handler in its threadpool; as `async def` they ran ON the event
+# loop, so an unreachable Tailscale peer's 3s connect timeout froze the chat stream, the TTS
+# socket, the Discord gateway and the log SSE along with it. Do not re-add `async` here.
 @router.get("/models")
-async def models_list():
-    options = agent.refresh_model_options()
+def models_list():
+    options = inference.refresh_model_options()
     return {
         "default": get_default_model_key(),
         "options": [
@@ -388,7 +394,7 @@ async def models_list():
 def _tailscale_ollama_reachable(provider_id):
     """Hit one Tailscale Ollama host's native /api/tags with a short timeout — same check
     discover_ollama_models does, but without parsing the model list, just for a live status dot."""
-    provider = agent.TAILSCALE_OLLAMA_PROVIDERS[provider_id]
+    provider = inference.TAILSCALE_OLLAMA_PROVIDERS[provider_id]
     host = (provider["host_url"] or "").removesuffix("/v1").rstrip("/")
     if not host:
         return False
@@ -401,12 +407,12 @@ def _tailscale_ollama_reachable(provider_id):
 
 
 @router.get("/system-status")
-async def system_status():
+def system_status():
     vm = psutil.virtual_memory()
     return {
         "ollama": {
             provider_id: _tailscale_ollama_reachable(provider_id)
-            for provider_id in agent.TAILSCALE_OLLAMA_PROVIDERS
+            for provider_id in inference.TAILSCALE_OLLAMA_PROVIDERS
         },
         "ram": {
             "used_mb": round((vm.total - vm.available) / (1024 * 1024)),
@@ -481,10 +487,10 @@ def _context_blocks():
 
 
 @router.get("/context-usage")
-async def context_usage(model: str = None):
+def context_usage(model: str = None):
     """Token totals per injected block. No block contents — this is polled every 20s."""
-    key = model if model in agent.MODEL_OPTIONS else get_default_model_key()
-    context_length = agent.MODEL_OPTIONS[key]["context_length"]
+    key = model if model in inference.MODEL_OPTIONS else get_default_model_key()
+    context_length = inference.MODEL_OPTIONS[key]["context_length"]
     blocks = [
         {
             "key": b["key"],
@@ -537,7 +543,7 @@ class _Generation:
 
     def __init__(self, user_input, model_key=None):
         self.user_input = user_input
-        self.model_key = model_key if model_key in agent.MODEL_OPTIONS else get_default_model_key()
+        self.model_key = model_key if model_key in inference.MODEL_OPTIONS else get_default_model_key()
         self.events = []
         self.done = False
         self.task = None

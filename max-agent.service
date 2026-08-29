@@ -7,6 +7,14 @@ Type=simple
 User=max
 WorkingDirectory=/home/max/app
 ExecStart=/home/max/.local/bin/uv run main.py
+# Required for User=max to bind 0.0.0.0:80 (host sysctl leaves ports <1024 privileged).
+# The installed unit has always had this; the repo copy did not, so deploying this file
+# to a new box produced PermissionError on bind with no obvious cause.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Default RestartSec is 100ms: a crash-at-import loop burns StartLimitBurst in half a
+# second and lands the unit in `failed` permanently, instead of riding out a transient
+# (Tailscale not up yet, Ollama host asleep).
+RestartSec=5
 Restart=on-failure
 
 [Install]
