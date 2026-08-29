@@ -508,6 +508,32 @@ def _save_jobs(jobs: dict):
         log.error("Failed to write jobs file %s: %s", filename, e)
 
 
+def _prune_expired_scheduled(jobs: dict):
+    """
+    Drop one-time jobs whose run_at has passed, returning the ones removed.
+
+    Not just tidiness: `_run_at_to_cron` emits no year field, so a past one-time job keeps a live
+    crontab line that fires again on the same date every year. It also stays in the {{JOBS}}
+    listing, where Max reads it as a reminder still pending.
+
+    Expiry is by *minute*, not instant: a job is pruned only once the clock has moved to a later
+    minute than its run_at, so a sync landing in the same minute the job is due can never remove
+    its cron line before it fires. Unparseable run_at values are left alone — `_run_at_to_cron`
+    already logs those, and dropping a job we failed to read would be silent data loss.
+    """
+    current_minute = datetime.now().replace(second=0, microsecond=0)
+    kept, removed = [], []
+    for job in jobs.get("scheduled", []):
+        try:
+            due = datetime.strptime(job["run_at"], "%Y-%m-%d %H:%M")
+        except (ValueError, KeyError):
+            kept.append(job)
+            continue
+        (removed if due < current_minute else kept).append(job)
+    jobs["scheduled"] = kept
+    return removed
+
+
 MANAGED_BEGIN = "# BEGIN max-agent jobs (managed — edited via the web UI)"
 MANAGED_END = "# END max-agent jobs"
 
@@ -544,6 +570,15 @@ def _sync_crontab():
         log.info("Dropped %d legacy unmanaged job-trigger line(s)", adopted)
 
     jobs = _load_jobs()
+    expired = _prune_expired_scheduled(jobs)
+    if expired:
+        _save_jobs(jobs)
+        log.info(
+            "Pruned %d expired scheduled job(s): %s",
+            len(expired),
+            ", ".join(f"{j.get('name', '?')} @ {j.get('run_at', '?')}" for j in expired),
+        )
+
     managed = [MANAGED_BEGIN]
     for job in jobs.get("cron", []):
         managed.append(
@@ -1086,6 +1121,9 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
 async def job_trigger(prompt: str = Body(embed=True), channel: str = Body(embed=True)):
     log.info("Job fired → channel=%s prompt=%r", channel, prompt[:120])
     turn = await _generate_reply(prompt, save_user_turn=False)
+    # The job that just fired is now expired; the reply took long enough that the minute has
+    # almost always rolled over, so this is what actually removes it in practice.
+    _sync_crontab()
     result = send_discord_message(channel, turn["content"])
     if result.get("ok"):
         log.info("Job message posted to Discord #%s", channel)
