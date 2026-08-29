@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent: downloads the Kokoro-82M fp32 ONNX model + voice pack into voice/tts/models/,
-# which docker-compose.yml bind-mounts into the container at /models. Run once per clone
-# (or whenever the models are missing) via scripts/setup-tts.sh.
-#
-# fp32, not fp16 or int8: int8 needs ConvInteger/MatMulInteger kernels this onnxruntime build
-# doesn't implement on EITHER execution provider (confirmed: NOT_IMPLEMENTED on CPU too, not
-# just CUDA). fp16 does run, but is numerically unstable — it deterministically produces
-# all-NaN output for a large fraction of real sentences, on both CPU and CUDA, and measured
-# CPU inference *slower* than fp32 despite the smaller file (extra fp16<->fp32 cast overhead
-# with no offsetting benefit on this hardware/build). fp32 measured faster on CPU and just as
-# fast on CUDA (RTF ~0.13-0.24), with zero silent/NaN failures across everything tested.
+# bind-mounted into the container at /models. Run via scripts/setup-tts.sh.
+# fp32, not fp16 (all-NaN output on many sentences) or int8 (kernels this ORT build lacks).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
