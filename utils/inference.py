@@ -29,22 +29,9 @@ log = get_logger(__name__)
 
 # Selectable inference backends — the UI's model selector picks a key from here per request.
 # Each is an OpenAI-compatible endpoint; base_url/api_key come from secrets/.env so credentials
-# stay out of source. The Ollama host's own entries are discovered dynamically (see
-# discover_ollama_models below) rather than hardcoded, so newly pulled models show up without
-# a code change.
-STATIC_MODEL_OPTIONS = {
-    "openrouter-nemotron": {
-        "label": "OpenRouter · Nemotron 3 Ultra",
-        "group": "OpenRouter",
-        "model_label": "Nemotron 3 Ultra",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "base_url": os.getenv("INFERENCE_HOST_URL"),
-        "api_key": os.getenv("INFERENCE_API_KEY"),
-        # The :free tier's context window (the paid tier is capped at 512,288).
-        "context_length": 1_000_000,
-    },
-}
-DEFAULT_MODEL_KEY = "openrouter-nemotron"
+# stay out of source. Nothing is hardcoded: every entry is discovered at runtime from the
+# Ollama hosts and OpenRouter's catalog, so a newly pulled model shows up without a code change
+# and a retired one disappears on its own.
 
 # Default when OpenRouter's /models doesn't report a context length for some entry.
 _OPENROUTER_DEFAULT_CONTEXT_LENGTH = 8192
@@ -52,17 +39,13 @@ _OPENROUTER_DEFAULT_CONTEXT_LENGTH = 8192
 
 def discover_openrouter_models():
     """
-    Query OpenRouter's /models endpoint for the full catalog, so the picker offers every model
-    available there instead of just the hardcoded Nemotron entry. The Nemotron model id itself is
-    skipped since STATIC_MODEL_OPTIONS already covers it (and must, so a picker default survives
-    even if this request fails). Unreachable/errors are logged and skipped — the static entry
-    still works.
+    Query OpenRouter's /models endpoint for the full catalog. Unreachable/errors are logged and
+    skipped — the Ollama hosts still provide options.
     """
     base_url = os.getenv("INFERENCE_HOST_URL")
     api_key = os.getenv("INFERENCE_API_KEY")
     if not base_url:
         return {}
-    static_model_id = STATIC_MODEL_OPTIONS["openrouter-nemotron"]["model"]
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     options = {}
     try:
@@ -75,7 +58,7 @@ def discover_openrouter_models():
 
     for entry in models:
         model_id = entry.get("id")
-        if not model_id or model_id == static_model_id:
+        if not model_id:
             continue
         name = entry.get("name") or model_id
         options[f"openrouter:{model_id}"] = {
@@ -166,19 +149,34 @@ def discover_ollama_models():
     return options
 
 
-MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
+MODEL_OPTIONS = {**discover_ollama_models(), **discover_openrouter_models()}
 
 
 def refresh_model_options():
     """Re-query the Ollama hosts and OpenRouter so newly available models show up without a restart."""
     global MODEL_OPTIONS
-    MODEL_OPTIONS = {**STATIC_MODEL_OPTIONS, **discover_ollama_models(), **discover_openrouter_models()}
+    MODEL_OPTIONS = {**discover_ollama_models(), **discover_openrouter_models()}
     return MODEL_OPTIONS
+
+
+def _default_model_key():
+    """
+    Last resort when no usable key is named. There is no hardcoded default: it's simply the
+    first discovered backend, which is a local Ollama model whenever a host is reachable
+    (Ollama is merged before the OpenRouter catalog). Raises rather than KeyError-ing deeper
+    in, so "nothing was discovered" reads as itself in the logs.
+    """
+    if not MODEL_OPTIONS:
+        raise RuntimeError(
+            "No inference backends discovered — every Ollama host and OpenRouter were "
+            "unreachable at startup. Call refresh_model_options() once one is back."
+        )
+    return next(iter(MODEL_OPTIONS))
 
 
 def _model_choice(model_key):
     """Resolve a UI model key to a client + model id + context window, falling back to the default."""
-    key = model_key if model_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
+    key = model_key if model_key in MODEL_OPTIONS else _default_model_key()
     opts = MODEL_OPTIONS[key]
     # AsyncOpenAI's own validation rejects a falsy api_key outright (it doesn't just get sent
     # and ignored) — a provider like the work MacBook's plain `ollama serve`, with no auth at
@@ -209,10 +207,10 @@ def get_default_model_key():
     The model key to use when a request doesn't name one: whatever last successfully generated
     a reply (persisted in context/config.json), so the picker — and scheduled jobs, which have
     no UI to pick from — pick up where the user left off instead of always landing back on
-    DEFAULT_MODEL_KEY.
+    the first discovered backend.
     """
     last_key = _load_config().get("last_model_key")
-    return last_key if last_key in MODEL_OPTIONS else DEFAULT_MODEL_KEY
+    return last_key if last_key in MODEL_OPTIONS else _default_model_key()
 
 
 def _remember_model_key(model_key):
@@ -224,6 +222,11 @@ def _remember_model_key(model_key):
     _save_config(config)
 
 
+def _is_free(model_key):
+    """Ollama runs on our own hardware; on OpenRouter only the `:free` tier costs nothing."""
+    return not model_key.startswith("openrouter:") or model_key.endswith(":free")
+
+
 def _model_fallback_candidates(preferred_key):
     """
     Ordered model keys to try: the requested one first, then every other configured model —
@@ -231,17 +234,14 @@ def _model_fallback_candidates(preferred_key):
     Ollama) doesn't fail the whole turn when another configured model could serve it.
     """
     ordered = [preferred_key] if preferred_key in MODEL_OPTIONS else []
-    # Only the hand-declared entries and the Tailscale Ollama hosts are fallback candidates.
-    # The discovered OpenRouter catalog is ~400 models and only a handful are :free, so
-    # walking it meant a single rate-limited free-tier failure — the *normal* failure here —
-    # could silently land the turn on a billed model, and _remember_model_key would then
-    # persist it as the default for every later request, scheduled jobs included. It also
-    # made a total outage take hundreds of sequential API calls to give up on.
-    ordered += [
-        key
-        for key in MODEL_OPTIONS
-        if key not in ordered and not key.startswith("openrouter:")
-    ]
+    # Automatic fallback may only land on something free: the Ollama hosts, and the :free
+    # tier of the OpenRouter catalog. Walking the whole catalog meant a single rate-limited
+    # free-tier failure — the normal failure here — could silently land the turn on a billed
+    # model, which _remember_model_key would then persist as the default for every later
+    # request, scheduled jobs included. It also made a total outage take hundreds of
+    # sequential API calls to give up on. A billed model still works when picked explicitly;
+    # it just never gets chosen on the user's behalf.
+    ordered += [key for key in MODEL_OPTIONS if key not in ordered and _is_free(key)]
     return ordered
 
 
