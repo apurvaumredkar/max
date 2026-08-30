@@ -1,4 +1,5 @@
 from ollama._utils import convert_function_to_tool
+import inspect
 import os
 import subprocess
 import shlex
@@ -12,7 +13,7 @@ from datetime import datetime
 import json
 import uuid
 from fastapi import APIRouter, Body
-from utils import inference
+from utils import inference, mcp_client
 from utils.discord_functions import send_discord_message
 from utils.inference import (
     EMBED_MODEL,
@@ -873,6 +874,27 @@ TOOL_SCHEMAS = [
 ]
 
 
+def tool_schemas():
+    """Native tools plus whatever the configured MCP servers are currently offering.
+
+    A function rather than a constant because mcp_client.refresh() rebinds its list — the same
+    trap as inference.MODEL_OPTIONS, and the loops and the context meter must all see a refresh.
+    """
+    return [*TOOL_SCHEMAS, *mcp_client.TOOL_SCHEMAS]
+
+
+async def _call_tool(name, arguments):
+    """Dispatch one tool call to a native function or, failing that, an MCP server."""
+    if name in AVAILABLE_TOOLS:
+        output = AVAILABLE_TOOLS[name](**arguments)
+        # Native tools are sync today; awaiting when needed lets an async one be registered
+        # without touching either loop.
+        return await output if inspect.isawaitable(output) else output
+    if mcp_client.handles(name):
+        return await mcp_client.call(name, arguments)
+    raise KeyError(name)
+
+
 async def _generate_reply(
     user_input: str, save_user_turn: bool = True, model_key: str = None
 ):
@@ -900,7 +922,7 @@ async def _generate_reply(
 
     while True:
         response, model_key = await _complete_with_fallback(
-            model_key, messages, TOOL_SCHEMAS
+            model_key, messages, tool_schemas()
         )
         message = response.choices[0].message
         messages.append(
@@ -937,7 +959,7 @@ async def _generate_reply(
             try:
                 arguments = json.loads(tool_call.function.arguments or "{}")
                 log.info("Tool call: %s(%s)", tool_call.function.name, arguments)
-                output = AVAILABLE_TOOLS[tool_call.function.name](**arguments)
+                output = await _call_tool(tool_call.function.name, arguments)
             except Exception as e:
                 log.exception("Tool %s failed", tool_call.function.name)
                 output = {"error": f"{type(e).__name__}: {e}"}
@@ -987,7 +1009,7 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
         round_content = ""
         round_thinking = ""
         async for resolved_key, chunk in _stream_with_fallback(
-            model_key, messages, TOOL_SCHEMAS
+            model_key, messages, tool_schemas()
         ):
             model_key = resolved_key
             delta = chunk.choices[0].delta
@@ -1050,7 +1072,7 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
             try:
                 arguments = json.loads(tc["arguments"] or "{}")
                 log.info("Tool call: %s(%s)", tc["name"], arguments)
-                output = AVAILABLE_TOOLS[tc["name"]](**arguments)
+                output = await _call_tool(tc["name"], arguments)
             except Exception as e:
                 log.exception("Tool %s failed", tc["name"])
                 output = {"error": f"{type(e).__name__}: {e}"}

@@ -22,7 +22,6 @@ from fastapi.responses import StreamingResponse
 
 from utils import agent, inference
 from utils.agent import (
-    TOOL_SCHEMAS,
     _generate_reply_stream,
     _jobs_system_message,
     _load_all_history,
@@ -352,6 +351,8 @@ def system_status():
 
 def _context_blocks():
     history = _load_history()
+    # Through the function, not a snapshot: MCP tools appear only after refresh().
+    schemas = agent.tool_schemas()
     persona, inlined = agent._render_persona()
     blocks = [
         {
@@ -410,8 +411,8 @@ def _context_blocks():
         {
             "key": "tools",
             "label": "Tool schemas",
-            "detail": f"{len(TOOL_SCHEMAS)} tools",
-            "content": json.dumps(TOOL_SCHEMAS),
+            "detail": f"{len(schemas)} tools",
+            "content": json.dumps(schemas),
         },
     ]
     return blocks

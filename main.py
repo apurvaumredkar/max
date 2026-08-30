@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from utils import agent, discord_functions, logs, spotify, tts, webui
+from utils import agent, discord_functions, logs, mcp_client, spotify, tts, webui
 from utils.logging_config import configure_logging, get_logger
 
 configure_logging()
@@ -19,6 +19,10 @@ async def lifespan(app: FastAPI):
         agent._sync_crontab()
     except Exception:
         log.exception("Crontab sync failed at startup; continuing without it")
+    try:
+        await mcp_client.refresh()
+    except Exception:
+        log.exception("MCP discovery failed at startup; continuing without MCP tools")
     discord_task = discord_functions.start_bot()
     yield
     if discord_task:
