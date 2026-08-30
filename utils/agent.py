@@ -506,6 +506,31 @@ def _cron(name: str, schedule: str, prompt: str, channel: str = "reminders"):
             "reminders" — only use another value if the user names a different configured channel.
     """
     jobs = _load_jobs()
+    # Same schedule and same prompt is the same job however it's named — a near-duplicate name
+    # (" Hydration Reminder" against "Hydration Reminder") is exactly how a job once cloned
+    # itself into firing twice an hour.
+    existing = next(
+        (
+            job
+            for job in jobs["cron"]
+            if job.get("schedule") == schedule
+            and (job.get("prompt") or "").strip() == (prompt or "").strip()
+        ),
+        None,
+    )
+    if existing:
+        log.info(
+            "Cron job %r already exists as %r (%s) — not creating a duplicate",
+            name,
+            existing.get("name"),
+            existing.get("id"),
+        )
+        return {
+            "status": "already_exists",
+            "name": existing.get("name"),
+            "schedule": schedule,
+            "prompt": existing.get("prompt"),
+        }
     jobs["cron"].append(
         {
             "id": uuid.uuid4().hex,
@@ -536,6 +561,29 @@ def _schedule(name: str, run_at: str, prompt: str, channel: str = "reminders"):
     """
     datetime.strptime(run_at, "%Y-%m-%d %H:%M")  # validate early
     jobs = _load_jobs()
+    # Same guard as _cron: same time and same prompt is the same reminder, whatever it's called.
+    existing = next(
+        (
+            job
+            for job in jobs["scheduled"]
+            if job.get("run_at") == run_at
+            and (job.get("prompt") or "").strip() == (prompt or "").strip()
+        ),
+        None,
+    )
+    if existing:
+        log.info(
+            "Scheduled job %r already exists as %r (%s) — not creating a duplicate",
+            name,
+            existing.get("name"),
+            existing.get("id"),
+        )
+        return {
+            "status": "already_exists",
+            "name": existing.get("name"),
+            "run_at": run_at,
+            "prompt": existing.get("prompt"),
+        }
     jobs["scheduled"].append(
         {
             "id": uuid.uuid4().hex,
@@ -792,6 +840,8 @@ def _render_persona():
 
 
 def system_messages(query=None):
+    # `query` is the user's message on the interactive path. The job path passes nothing on
+    # purpose — see _generate_reply.
     persona, inlined = _render_persona()
     messages = [{"role": "system", "content": persona}]
     fallbacks = {
@@ -838,7 +888,12 @@ async def _generate_reply(
         _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [*system_messages(user_input), *context]
+    # No automatic recall here. A job's prompt is a self-contained instruction to future Max, not
+    # a user asking about the past — and with no real user turn to anchor them, recalled excerpts
+    # read as the most recent instruction. A hydration reminder firing recalled the conversation
+    # that first set it up and re-created the job, which is the same failure _jobs_system_message
+    # exists to prevent. The interactive path passes its query; this one deliberately doesn't.
+    messages = [*system_messages(), *context]
     if not save_user_turn:
         messages.append({"role": "user", "content": user_input})
     tool_calls_log = []
