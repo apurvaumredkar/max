@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from ollama import Client
 from openai import AsyncOpenAI
 
+from utils import usage
 from utils.logging_config import get_logger
 
 load_dotenv("secrets/.env")
@@ -165,6 +166,19 @@ def _model_choice(model_key):
     return client, opts["model"], opts["context_length"]
 
 
+def _record_usage(model_key, response_usage):
+    if not response_usage:
+        return
+    opts = MODEL_OPTIONS.get(model_key, {})
+    usage.record(
+        model_key,
+        opts.get("group") or "unknown",
+        opts.get("model_label") or opts.get("model") or model_key,
+        getattr(response_usage, "prompt_tokens", 0),
+        getattr(response_usage, "completion_tokens", 0),
+    )
+
+
 CONFIG_PATH = "context/config.json"
 
 
@@ -229,8 +243,22 @@ async def _complete_with_fallback(model_key, messages, tools):
         if candidate_key != model_key:
             log.warning("Fell back from model %s to %s", model_key, candidate_key)
         _remember_model_key(candidate_key)
+        _record_usage(candidate_key, getattr(response, "usage", None))
         return response, candidate_key
     raise last_error
+
+
+def _absorb_usage(model_key, chunk, recorded):
+    """Record a streamed chunk's usage; True if the chunk was usage-only and must not be yielded.
+
+    `recorded` is a one-element list guarding against a provider that repeats cumulative usage on
+    every chunk — only the last report for a stream counts, and double-counting would silently
+    inflate the daily report.
+    """
+    chunk_usage = getattr(chunk, "usage", None)
+    if chunk_usage:
+        recorded[0] = (model_key, chunk_usage)
+    return chunk_usage is not None and not getattr(chunk, "choices", None)
 
 
 async def _stream_with_fallback(model_key, messages, tools):
@@ -244,6 +272,7 @@ async def _stream_with_fallback(model_key, messages, tools):
                 messages=messages,
                 tools=tools,
                 stream=True,
+                stream_options={"include_usage": True},
                 extra_body={"options": {"num_ctx": context_length}, "keep_alive": -1},
             )
             aiter = stream.__aiter__()
@@ -269,9 +298,16 @@ async def _stream_with_fallback(model_key, messages, tools):
         if candidate_key != model_key:
             log.warning("Fell back from model %s to %s", model_key, candidate_key)
         _remember_model_key(candidate_key)
-        yield candidate_key, first_chunk
+        recorded = [None]
+        if not _absorb_usage(candidate_key, first_chunk, recorded):
+            yield candidate_key, first_chunk
         async for chunk in aiter:
-            yield candidate_key, chunk
+            # The usage chunk arrives last and carries no choices, so it's held back rather than
+            # handed to the agent loops, which index choices[0].
+            if not _absorb_usage(candidate_key, chunk, recorded):
+                yield candidate_key, chunk
+        if recorded[0]:
+            _record_usage(*recorded[0])
         return
     raise last_error
 

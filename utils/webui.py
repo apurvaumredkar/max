@@ -390,6 +390,16 @@ def _context_blocks():
             "detail": "listing of context/**.md",
             "content": agent._context_files_system_message()["content"],
         })
+    # Retrieval is driven by the incoming message, which the meter doesn't have — so it reports
+    # what the last generated turn actually recalled rather than re-running retrieval per poll.
+    recalled = agent.last_recalled_message
+    if recalled:
+        blocks.append({
+            "key": "recalled",
+            "label": "Recalled history",
+            "detail": "auto-retrieved from earlier days",
+            "content": recalled["content"],
+        })
     blocks += [
         {
             "key": "history",

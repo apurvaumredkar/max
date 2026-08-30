@@ -2,6 +2,12 @@ from ollama._utils import convert_function_to_tool
 import os
 import subprocess
 import shlex
+import sqlite3
+import hashlib
+import math
+import re
+from collections import Counter
+from array import array
 from datetime import datetime
 import json
 import uuid
@@ -73,6 +79,173 @@ def _cosine_similarity(a, b):
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
+EMBED_CACHE_PATH = "context/embeddings.sqlite3"
+# all-minilm silently truncates at 512 tokens, so a long turn's tail would never be searchable.
+# ~1200 characters stays inside that window even for token-dense text (code, JSON tool output).
+CHUNK_CHARS = 1200
+CHUNK_OVERLAP = 150
+
+
+def _chunk_text(text):
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= CHUNK_CHARS:
+        return [text]
+    step = CHUNK_CHARS - CHUNK_OVERLAP
+    return [text[start : start + CHUNK_CHARS] for start in range(0, len(text), step)]
+
+
+def _open_embed_cache():
+    db = sqlite3.connect(EMBED_CACHE_PATH)
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS embeddings ("
+        "key TEXT NOT NULL, model TEXT NOT NULL, vector BLOB NOT NULL, "
+        "PRIMARY KEY (key, model))"
+    )
+    return db
+
+
+# Cache keys are a hash of the text itself, so an edited or deleted turn needs no invalidation
+# and only genuinely new text ever reaches the embedding model.
+def _embed_texts(texts):
+    if not texts:
+        return []
+    keys = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]
+    wanted = dict(zip(keys, texts))
+    cached = {}
+    try:
+        db = _open_embed_cache()
+    except Exception as e:
+        log.warning("Embedding cache unavailable (%s); embedding everything", e)
+        db = None
+    if db is not None:
+        try:
+            unique = list(wanted)
+            for start in range(0, len(unique), 500):
+                batch = unique[start : start + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = db.execute(
+                    f"SELECT key, vector FROM embeddings WHERE model = ? AND key IN ({placeholders})",
+                    (EMBED_MODEL, *batch),
+                ).fetchall()
+                for key, blob in rows:
+                    cached[key] = array("f", blob).tolist()
+        except Exception as e:
+            log.warning("Failed to read embedding cache: %s", e)
+
+    missing = [(key, text) for key, text in wanted.items() if key not in cached]
+    if missing:
+        fresh = embed_client.embed(
+            model=EMBED_MODEL, input=[text for _, text in missing]
+        ).embeddings
+        for (key, _), vector in zip(missing, fresh):
+            cached[key] = list(vector)
+        if db is not None:
+            try:
+                db.executemany(
+                    "INSERT OR REPLACE INTO embeddings (key, model, vector) VALUES (?, ?, ?)",
+                    [
+                        (key, EMBED_MODEL, array("f", cached[key]).tobytes())
+                        for key, _ in missing
+                    ],
+                )
+                db.commit()
+            except Exception as e:
+                log.warning("Failed to write embedding cache: %s", e)
+        log.info(
+            "Embedded %s new chunk(s), %s served from cache",
+            len(missing),
+            len(cached) - len(missing),
+        )
+    if db is not None:
+        db.close()
+    return [cached[key] for key in keys]
+
+
+_TOKEN = re.compile(r"[a-z0-9']+")
+# "max" is the agent's own name and appears throughout the corpus, so it carries no signal and
+# would otherwise make every greeting look like a lexical match.
+_STOPWORDS = set(
+    "max the a an and or but if of to in on at for with is are was were be been am i you it this "
+    "that these those my your we us our do does did what when how why who can could would should "
+    "will just about from as by not no yes me he she they them there here so up out get got have "
+    "has had like more some any than then too very".split()
+)
+BM25_K1 = 1.5
+BM25_B = 0.75
+# Semantic similarity alone can't find a literal term the embedding blurs (a proper noun, a
+# filename); lexical alone can't match a paraphrase. Weighted evenly, each covers the other's miss.
+SEMANTIC_WEIGHT = 0.5
+
+
+def _tokenize(text):
+    return [
+        word
+        for word in _TOKEN.findall((text or "").lower())
+        if len(word) > 2 and word not in _STOPWORDS
+    ]
+
+
+def _bm25_scores(query_tokens, documents):
+    if not query_tokens or not documents:
+        return [0.0] * len(documents)
+    total = len(documents)
+    doc_freq = Counter()
+    for document in documents:
+        doc_freq.update(set(document))
+    avg_len = sum(len(d) for d in documents) / total or 1.0
+    idf = {
+        word: math.log(1 + (total - n + 0.5) / (n + 0.5)) for word, n in doc_freq.items()
+    }
+    scores = []
+    for document in documents:
+        freqs = Counter(document)
+        length = len(document) or 1
+        score = 0.0
+        for word in set(query_tokens):
+            freq = freqs.get(word, 0)
+            if not freq or word not in idf:
+                continue
+            score += (
+                idf[word]
+                * freq
+                * (BM25_K1 + 1)
+                / (freq + BM25_K1 * (1 - BM25_B + BM25_B * length / avg_len))
+            )
+        scores.append(score)
+    return scores
+
+
+def _rank_past_turns(query):
+    past_turns = _load_past_history()
+    chunks = [
+        (turn, chunk)
+        for turn in past_turns
+        for chunk in _chunk_text(turn.get("content"))
+    ]
+    if not chunks:
+        return []
+    query_embedding = _embed_texts([query])[0]
+    chunk_embeddings = _embed_texts([chunk for _, chunk in chunks])
+    documents = [_tokenize(chunk) for _, chunk in chunks]
+    lexical = _bm25_scores(_tokenize(query), documents)
+    # BM25 has no fixed range, so it's scaled against the best hit for this query before being
+    # blended with cosine similarity, which is already 0-1.
+    best_lexical = max(lexical) or 1.0
+    # A turn scores as its best-matching chunk, so a long turn ranks on whichever part is
+    # actually relevant rather than on an average diluted by everything else it contains.
+    best = {}
+    for (turn, _), vector, lex in zip(chunks, chunk_embeddings, lexical):
+        turn_id = turn.get("id") or id(turn)
+        score = SEMANTIC_WEIGHT * _cosine_similarity(query_embedding, vector) + (
+            1 - SEMANTIC_WEIGHT
+        ) * (lex / best_lexical)
+        if score > best.get(turn_id, (None, -1.0))[1]:
+            best[turn_id] = (turn, score)
+    return sorted(best.values(), key=lambda pair: pair[1], reverse=True)
+
+
 def _search_history(query: str, top_k: int = 5):
     """
     Semantically search prior days' conversation history (not today's) for turns relevant to a
@@ -83,20 +256,13 @@ def _search_history(query: str, top_k: int = 5):
         query: What to search for, described in natural language.
         top_k: Maximum number of matching turns to return.
     """
-    past_turns = _load_past_history()
-    if not past_turns:
+    scored = _rank_past_turns(query)
+    if not scored:
         return {"results": []}
-    contents = [turn["content"] for turn in past_turns]
-    query_embedding = embed_client.embed(model=EMBED_MODEL, input=query).embeddings[0]
-    turn_embeddings = embed_client.embed(model=EMBED_MODEL, input=contents).embeddings
-    scored = sorted(
-        zip(past_turns, turn_embeddings),
-        key=lambda pair: _cosine_similarity(query_embedding, pair[1]),
-        reverse=True,
-    )
     return {
         "results": [
             {
+                "turn_id": turn.get("id"),
                 "role": turn["role"],
                 "content": turn["content"],
                 "timestamp": turn.get("timestamp"),
@@ -541,6 +707,70 @@ def _skills_system_message():
     }
 
 
+# Retrieval runs on every turn rather than waiting for the model to call `_search_history`, so
+# recall doesn't depend on the model realising it has forgotten something. These constants are
+# heuristics hand-tuned against the real corpus, not derived — revisit them if recall starts
+# injecting noise or missing obvious references.
+RECALL_MIN_SCORE = 0.40
+RECALL_TOP_K = 3
+RECALL_MAX_CHARS = 1500
+# Short turns ("hi", "thanks", "ok") match old greetings almost perfectly yet carry nothing worth
+# recalling, so they're excluded on content rather than on score.
+RECALL_MIN_TURN_CHARS = 200
+
+# What the last generated turn actually recalled, so the context meter can report it without
+# re-running retrieval on every poll — and reports what was really injected, not an approximation.
+last_recalled_message = None
+
+
+def _recalled_history_system_message(query):
+    global last_recalled_message
+    if not (query or "").strip():
+        return None
+    try:
+        scored = _rank_past_turns(query)
+    except Exception as e:
+        # Recall is an enhancement; a dead embedding host must not take the whole turn down.
+        log.warning("Automatic history recall failed: %s", e)
+        return None
+    hits = [
+        (turn, score)
+        for turn, score in scored
+        if score >= RECALL_MIN_SCORE
+        and len(turn.get("content") or "") >= RECALL_MIN_TURN_CHARS
+    ][:RECALL_TOP_K]
+    if not hits:
+        last_recalled_message = None
+        return None
+    log.info(
+        "Recalled %s past turn(s) for this message (top score %.2f)",
+        len(hits),
+        hits[0][1],
+    )
+    excerpts = []
+    for turn, score in hits:
+        content = turn.get("content") or ""
+        if len(content) > RECALL_MAX_CHARS:
+            content = content[:RECALL_MAX_CHARS] + " […]"
+        excerpts.append(
+            f"- [{turn.get('timestamp', 'unknown date')}] {turn.get('role')} "
+            f"(relevance {score:.2f}):\n{content}"
+        )
+    last_recalled_message = {
+        "role": "system",
+        "content": (
+            "Possibly relevant excerpts from earlier conversations, retrieved automatically "
+            "because they resemble the user's latest message:\n\n"
+            + "\n\n".join(excerpts)
+            + "\n\nThese are excerpts, not the current conversation, and the match is by "
+            "similarity alone — some may be irrelevant. Use them only where they genuinely "
+            "apply, cite the date when you rely on one, and call `_search_history` yourself if "
+            "you need more or the excerpt is cut off."
+        ),
+    }
+    return last_recalled_message
+
+
 # SYSTEM.md may place any of these inline as `{{NAME}}`, so the persona controls *where* live
 # state appears in its own narrative instead of it arriving as a detached block after the prompt.
 PERSONA_VARIABLES = {
@@ -561,7 +791,7 @@ def _render_persona():
     return persona, inlined
 
 
-def system_messages():
+def system_messages(query=None):
     persona, inlined = _render_persona()
     messages = [{"role": "system", "content": persona}]
     fallbacks = {
@@ -572,6 +802,9 @@ def system_messages():
     for name, build in fallbacks.items():
         if name not in inlined:
             messages.append(build())
+    recalled = _recalled_history_system_message(query)
+    if recalled:
+        messages.append(recalled)
     return messages
 
 
@@ -605,7 +838,7 @@ async def _generate_reply(
         _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [*system_messages(), *context]
+    messages = [*system_messages(user_input), *context]
     if not save_user_turn:
         messages.append({"role": "user", "content": user_input})
     tool_calls_log = []
@@ -689,7 +922,7 @@ async def _generate_reply_stream(user_input: str, model_key: str = None):
     _save_turn({"role": "user", "content": user_input})
     history = _load_history()
     context = [{"role": turn["role"], "content": turn["content"]} for turn in history]
-    messages = [*system_messages(), *context]
+    messages = [*system_messages(user_input), *context]
     tool_calls_log = []
     content = ""
     thinking = ""
