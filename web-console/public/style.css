@@ -14,10 +14,19 @@ header{display:flex;align-items:flex-start;gap:2.5vw}
 .log .msg{margin-bottom:.9rem}
 .log .para{display:block;margin-top:.45em}
 .log .think{color:var(--dim);font-style:italic;margin-bottom:.45em}
+.log .steptext{margin-bottom:.45em;white-space:pre-wrap}
+.log .tool{color:var(--dim);border-left:1px dotted var(--dim);padding-left:.6em;margin-bottom:.45em}
+.log .tool .cmd{color:var(--fg)}
 .log .who{color:var(--dim)}
 .log .assistant .who{color:var(--accent)}
 .log .err{color:var(--bad)}
-.input{display:flex;align-items:flex-end;gap:.6rem;border-top:1px dotted var(--dim);padding-top:.75rem}
+/* context meter = the divider above the input: a dotted line with a title like the section boxes, filled in blue */
+.ctxmeter{display:flex;align-items:center;gap:.35rem;margin-top:.5rem;white-space:pre}
+.ctxmeter .lead{flex:none;width:.75rem;border-top:1px dotted var(--dim)}
+.ctxmeter .track{flex:1;position:relative;border-top:1px dotted var(--dim)}
+.ctxmeter .fill{position:absolute;left:0;top:-2px;height:3px;background:var(--accent)}
+.ctxmeter .dim{color:var(--dim)}
+.input{display:flex;align-items:flex-end;gap:.6rem;padding-top:.5rem}
 .input textarea{flex:1;resize:none;overflow-y:auto;max-height:40vh;background:transparent;color:var(--fg);border:0;outline:0;
   font:inherit;padding:.3rem 0;margin:0}
 .input textarea::placeholder{color:var(--dim)}

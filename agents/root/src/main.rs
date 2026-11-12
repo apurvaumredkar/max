@@ -4,19 +4,29 @@
 //!   root            HTTP service on 127.0.0.1:$ROOT_PORT (default 8007): GET /history, POST /chat {"text"}
 //!   root chat       the same conversation as a terminal loop (/exit or Ctrl-D to quit)
 //!
+//! Tools (tools.rs): the model can call `bash`; a turn loops request -> tool calls -> results until it answers.
+//! All model traffic is plain HTTP to Ollama's /api/chat (JSON built here, NDJSON stream parsed here).
+//!
 //! Slash commands (web and terminal): /clear <N> deletes the last N turns from the history and the context;
 //! /think [on|off] toggles the model's thinking (on at start).
 //! /voice (web console only) opens a voice session on GET /voice (WebSocket): see voice.rs.
 //!
 //! Logs (via the shared `agentlog` crate) go to agents/logs/agents.jsonl, which the web console streams.
 
+mod tools;
 mod voice;
 
 use std::{path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Instant};
 
 use agentlog::{error, info};
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
+    routing::{get, post},
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,8 +34,8 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-const MODEL: &str = "ornith-1.5:35b";
-const NUM_CTX: u32 = 65536;
+const MODEL: &str = "gemma4:e4b";
+const NUM_CTX: u32 = 131072; // gemma4:e4b full context
 
 struct Agent {
     home: PathBuf,
@@ -39,10 +49,58 @@ struct Agent {
     think: AtomicBool,            // model thinking on/off (/think); starts on, not kept across restarts
 }
 
+const MAX_ROUNDS: usize = 25; // model calls per turn (each tool round is one more)
+
 /// A piece of a streamed turn.
 pub(crate) enum Delta<'a> {
     Thinking(&'a str),
     Content(&'a str),
+    ToolCall { name: &'a str, args: &'a Value },
+    ToolResult { output: &'a str },
+}
+
+/// A finished (or interrupted) turn. `reply` is the final answer only: it is all that goes back into the model's
+/// context in later turns. `steps` is everything before it, in order, kept for display:
+///   {"type":"thinking","text"} | {"type":"text","text"} (said before a tool call) | {"type":"tool","name","command","output"}
+#[derive(Default)]
+pub(crate) struct Turn {
+    pub reply: String,
+    pub thinking: Option<String>, // all thinking, joined (logs; also in steps)
+    pub steps: Vec<Value>,
+    pub interrupted: bool,
+    pub ctx: Option<u64>, // tokens in the context window at the end of the turn (last request: prompt + output)
+}
+
+/// Turn events for the chat pane (typed chat over SSE, and voice): the same JSON either way.
+pub(crate) fn delta_event(d: &Delta) -> Value {
+    match d {
+        Delta::Thinking(t) => json!({"type": "thinking_delta", "text": t}),
+        Delta::Content(c) => json!({"type": "reply_delta", "text": c}),
+        Delta::ToolCall { name, args } => json!({"type": "tool_call", "name": name, "command": tools::label(name, args)}),
+        Delta::ToolResult { output } => {
+            json!({"type": "tool_result", "output": output.chars().take(4000).collect::<String>()}) // pane shows the top
+        }
+    }
+}
+
+pub(crate) fn reply_event(t: &Turn) -> Value {
+    json!({"type": "reply", "text": t.reply, "thinking": t.thinking, "steps": t.steps, "interrupted": t.interrupted,
+           "context": context(t.ctx)})
+}
+
+/// A stored message (see `open` for the table).
+struct Row {
+    msg: Msg,
+    at: String,
+    thinking: Option<String>,
+    tools: Option<String>, // older rows: tool calls without order (before steps existed)
+    steps: Option<String>,
+    ctx: Option<i64>,
+}
+
+/// Context meter for the chat pane: tokens used (None: not known yet) out of the window.
+pub(crate) fn context(used: Option<u64>) -> Value {
+    json!({"used": used, "max": NUM_CTX})
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -83,123 +141,105 @@ impl Agent {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                thinking TEXT)",
+                thinking TEXT,
+                tools TEXT,
+                ctx INTEGER,
+                steps TEXT)",
         )?;
-        // tables made before thoughts were kept lack the column; add it (fails harmlessly once it exists)
+        // older tables lack these columns; add them (fails harmlessly once they exist)
         let _ = db.execute("ALTER TABLE root ADD COLUMN thinking TEXT", []);
+        let _ = db.execute("ALTER TABLE root ADD COLUMN tools TEXT", []);
+        let _ = db.execute("ALTER TABLE root ADD COLUMN ctx INTEGER", []);
+        let _ = db.execute("ALTER TABLE root ADD COLUMN steps TEXT", []);
         Ok(db)
     }
 
-    /// Every stored message with its timestamp and (for replies) the model's thoughts.
-    fn history(&self) -> Result<Vec<(Msg, String, Option<String>)>, String> {
+    /// Every stored message with its timestamp and, for replies, the model's thoughts and tool calls (JSON).
+    fn history(&self) -> Result<Vec<Row>, String> {
         let db = self.open().map_err(|e| e.to_string())?;
-        let mut st = db.prepare("SELECT role, content, created_at, thinking FROM root ORDER BY id")
+        let mut st = db.prepare("SELECT role, content, created_at, thinking, tools, ctx, steps FROM root ORDER BY id")
             .map_err(|e| e.to_string())?;
-        st.query_map([], |r| Ok((Msg { role: r.get(0)?, content: r.get(1)? }, r.get(2)?, r.get(3)?)))
+        st.query_map([], |r| Ok(Row { msg: Msg { role: r.get(0)?, content: r.get(1)? }, at: r.get(2)?, thinking: r.get(3)?,
+                                      tools: r.get(4)?, ctx: r.get(5)?, steps: r.get(6)? }))
             .and_then(|rows| rows.collect())
             .map_err(|e| e.to_string())
     }
 
-    /// One exchange: send persona + full history + `text`, store both sides once the reply arrives.
-    /// Returns (reply, thoughts). Past thoughts are kept for display but not sent back to the model.
-    async fn chat(&self, text: &str) -> Result<(String, Option<String>), String> {
-        let _turn = self.turn.lock().await;
-        let started = Instant::now();
-        info!(chars = text.chars().count(), "user message");
-        let result = self.turn_inner(text).await;
-        let ms = started.elapsed().as_millis() as u64;
-        match &result {
-            Ok((reply, thinking, stats)) => info!(ms, prompt_tokens = stats.0, reply_tokens = stats.1,
-                chars = reply.chars().count(), thinking_chars = thinking.as_deref().map_or(0, |t| t.chars().count()),
-                "reply"),
-            Err(e) => error!(ms, error = %e, "turn failed"),
-        }
-        result.map(|(reply, thinking, _)| (reply, thinking))
+    /// One exchange, not streamed (typed chat and the terminal): the same loop as `chat_stream`, nothing to show
+    /// along the way and no interrupt.
+    async fn chat(&self, text: &str) -> Result<Turn, String> {
+        self.chat_stream(text, &CancellationToken::new(), |_| {}).await
     }
 
-    /// What the model sees for a turn: persona, the stored conversation (no thoughts), then `text`.
-    fn messages_for(&self, text: &str) -> Result<Vec<Msg>, String> {
+    /// What the model sees for a turn: persona, the stored conversation, then `text`. Past thoughts and tool calls
+    /// are kept for display only and not sent back.
+    fn messages_for(&self, text: &str) -> Result<Vec<Value>, String> {
         let persona = std::fs::read_to_string(&self.persona)
             .map_err(|e| format!("{}: {e}", self.persona.display()))?;
-        let mut messages = vec![Msg { role: "system".into(), content: persona }];
-        messages.extend(self.history()?.into_iter().map(|(m, _, _)| m));
-        messages.push(Msg { role: "user".into(), content: text.into() });
+        let mut messages = vec![json!({"role": "system", "content": persona})];
+        messages.extend(self.history()?.into_iter().map(|r| json!({"role": r.msg.role, "content": r.msg.content})));
+        messages.push(json!({"role": "user", "content": text}));
         Ok(messages)
     }
 
-    fn store(&self, text: &str, reply: &str, thinking: Option<&str>) -> Result<(), String> {
+    fn store(&self, text: &str, turn: &Turn) -> Result<(), String> {
         let db = self.open().map_err(|e| e.to_string())?;
+        let steps = (!turn.steps.is_empty()).then(|| Value::Array(turn.steps.clone()).to_string());
         db.execute("INSERT INTO root (role, content) VALUES ('user', ?1)", [text]).map_err(|e| e.to_string())?;
-        db.execute("INSERT INTO root (role, content, thinking) VALUES ('assistant', ?1, ?2)",
-                   rusqlite::params![reply, thinking]).map_err(|e| e.to_string())?;
+        db.execute("INSERT INTO root (role, content, thinking, steps, ctx) VALUES ('assistant', ?1, ?2, ?3, ?4)",
+                   rusqlite::params![turn.reply, turn.thinking, steps, turn.ctx.map(|c| c as i64)])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    async fn turn_inner(&self, text: &str) -> Result<(String, Option<String>, (u64, u64)), String> {
-        let messages = self.messages_for(text)?;
-        let resp = self
-            .http
-            .post(&self.chat_url)
-            .json(&json!({"model": MODEL, "messages": messages, "stream": false, "think": self.think.load(Ordering::Relaxed),
-                          "options": {"num_ctx": NUM_CTX}}))
-            .send()
-            .await
-            .map_err(|e| format!("ollama: {e}"))?;
-        let status = resp.status();
-        let body: Value = resp.json().await.map_err(|e| format!("ollama: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("ollama {status}: {}", body["error"].as_str().unwrap_or("?")));
-        }
-        let reply = body["message"]["content"].as_str().ok_or("ollama: no message in reply")?.to_string();
-        let thinking = body["message"]["thinking"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
-        let stats = (body["prompt_eval_count"].as_u64().unwrap_or(0), body["eval_count"].as_u64().unwrap_or(0));
-
-        self.store(text, &reply, thinking.as_deref())?;
-        Ok((reply, thinking, stats))
-    }
-
-    /// Like `chat`, but streams: `on` gets each piece of thinking and reply as the model writes it. Cancelling `cancel`
-    /// stops generation; the partial reply is stored (so the context matches what was said). Returns
-    /// (reply, thoughts, interrupted).
+    /// One turn, streamed: `on` gets thinking, reply text and tool activity as they happen. The model may call tools;
+    /// each round of calls is run and sent back until it answers without one (at most MAX_ROUNDS requests).
+    /// Cancelling `cancel` stops generation or the running tool; the partial turn is stored, so the context matches
+    /// what was said.
     pub(crate) async fn chat_stream(&self, text: &str, cancel: &CancellationToken, mut on: impl FnMut(Delta))
-        -> Result<(String, Option<String>, bool), String> {
+        -> Result<Turn, String> {
         let _turn = self.turn.lock().await;
         let started = Instant::now();
-        info!(chars = text.chars().count(), stream = true, "user message");
-        let result = self.stream_inner(text, cancel, &mut on).await;
+        info!(chars = text.chars().count(), "user message");
+        let result = self.turn_inner(text, cancel, &mut on).await;
         let ms = started.elapsed().as_millis() as u64;
         match &result {
-            Ok((reply, thinking, interrupted, stats)) => info!(ms, prompt_tokens = stats.0, reply_tokens = stats.1,
-                chars = reply.chars().count(), thinking_chars = thinking.as_deref().map_or(0, |t| t.chars().count()),
-                interrupted, "reply"),
+            Ok((t, stats)) => info!(ms, prompt_tokens = stats.0, reply_tokens = stats.1, chars = t.reply.chars().count(),
+                thinking_chars = t.thinking.as_deref().map_or(0, |t| t.chars().count()), steps = t.steps.len(),
+                interrupted = t.interrupted, "reply"),
             Err(e) => error!(ms, error = %e, "turn failed"),
         }
-        result.map(|(reply, thinking, interrupted, _)| (reply, thinking, interrupted))
+        result.map(|(t, _)| t)
     }
 
-    async fn stream_inner(&self, text: &str, cancel: &CancellationToken, on: &mut impl FnMut(Delta))
-        -> Result<(String, Option<String>, bool, (u64, u64)), String> {
-        let messages = self.messages_for(text)?;
-        let req = self.http.post(&self.chat_url)
-            .json(&json!({"model": MODEL, "messages": messages, "stream": true, "think": self.think.load(Ordering::Relaxed),
-                          "options": {"num_ctx": NUM_CTX}}))
-            .send();
-        let (mut reply, mut thinking, mut stats, mut interrupted) = (String::new(), String::new(), (0, 0), false);
-        let resp = tokio::select! {
-            r = req => Some(r.map_err(|e| format!("ollama: {e}"))?),
-            _ = cancel.cancelled() => None,
-        };
-        if let Some(resp) = resp {
+    async fn turn_inner(&self, text: &str, cancel: &CancellationToken, on: &mut impl FnMut(Delta))
+        -> Result<(Turn, (u64, u64)), String> {
+        let mut messages = self.messages_for(text)?;
+        let (mut turn, mut thinking, mut stats) = (Turn::default(), String::new(), (0, 0));
+        // Within the turn the model sees its own tool calls and results (`messages` grows); none of it is stored
+        // as context: only `text` and the final `turn.reply` are, while `turn.steps` keeps it all for display.
+        for round in 0..MAX_ROUNDS {
+            let req = self.http.post(&self.chat_url)
+                .json(&json!({"model": MODEL, "messages": messages, "tools": tools::specs(), "stream": true,
+                              "think": self.think.load(Ordering::Relaxed), "options": {"num_ctx": NUM_CTX}}))
+                .send();
+            let resp = tokio::select! {
+                r = req => r.map_err(|e| format!("ollama: {e}"))?,
+                _ = cancel.cancelled() => { turn.interrupted = true; break }
+            };
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body: Value = resp.json().await.unwrap_or_default();
                 return Err(format!("ollama {status}: {}", body["error"].as_str().unwrap_or("?")));
             }
+
+            // read the NDJSON stream: thinking/content pieces, tool calls, and the final stats line
             let (mut body, mut line) = (resp.bytes_stream(), Vec::<u8>::new());
+            let (mut content, mut round_thinking, mut calls) = (String::new(), String::new(), Vec::<Value>::new());
             loop {
                 let chunk = tokio::select! {
                     c = body.next() => c,
-                    _ = cancel.cancelled() => { interrupted = true; break } // dropping the stream stops Ollama
+                    _ = cancel.cancelled() => { turn.interrupted = true; break } // dropping the stream stops Ollama
                 };
                 let Some(chunk) = chunk else { break };
                 line.extend_from_slice(&chunk.map_err(|e| format!("ollama: {e}"))?);
@@ -208,26 +248,69 @@ impl Agent {
                     if let Some(e) = v["error"].as_str() {
                         return Err(format!("ollama: {e}"));
                     }
-                    if let Some(t) = v["message"]["thinking"].as_str().filter(|t| !t.is_empty()) {
-                        thinking.push_str(t);
+                    let m = &v["message"];
+                    if let Some(t) = m["thinking"].as_str().filter(|t| !t.is_empty()) {
+                        round_thinking.push_str(t);
                         on(Delta::Thinking(t));
                     }
-                    if let Some(c) = v["message"]["content"].as_str().filter(|c| !c.is_empty()) {
-                        reply.push_str(c);
+                    if let Some(c) = m["content"].as_str().filter(|c| !c.is_empty()) {
+                        content.push_str(c);
                         on(Delta::Content(c));
                     }
+                    if let Some(tc) = m["tool_calls"].as_array() {
+                        calls.extend(tc.iter().cloned());
+                    }
                     if v["done"].as_bool() == Some(true) {
-                        stats = (v["prompt_eval_count"].as_u64().unwrap_or(0), v["eval_count"].as_u64().unwrap_or(0));
+                        stats.0 += v["prompt_eval_count"].as_u64().unwrap_or(0);
+                        stats.1 += v["eval_count"].as_u64().unwrap_or(0);
+                        // last request wins: what the window held when the model finished
+                        turn.ctx = Some(v["prompt_eval_count"].as_u64().unwrap_or(0) + v["eval_count"].as_u64().unwrap_or(0));
                     }
                 }
             }
-        } else {
-            interrupted = true;
+            if !round_thinking.trim().is_empty() {
+                turn.steps.push(json!({"type": "thinking", "text": round_thinking.trim()}));
+                thinking.push_str(round_thinking.trim());
+                thinking.push_str("\n\n");
+            }
+            if turn.interrupted || calls.is_empty() {
+                turn.reply = content; // the final answer (or what was said before an interrupt)
+                break;
+            }
+
+            // run this round's tool calls and hand the results back for the next round
+            if !content.trim().is_empty() {
+                turn.steps.push(json!({"type": "text", "text": content.trim()}));
+            }
+            messages.push(json!({"role": "assistant", "content": content, "tool_calls": calls}));
+            for call in &calls {
+                let name = call["function"]["name"].as_str().unwrap_or("?");
+                let args = &call["function"]["arguments"];
+                on(Delta::ToolCall { name, args });
+                let output = tokio::select! {
+                    o = tools::run(name, args) => o,
+                    _ = cancel.cancelled() => { turn.interrupted = true; "(interrupted)".to_string() }
+                };
+                on(Delta::ToolResult { output: &output });
+                turn.steps.push(json!({"type": "tool", "name": name, "command": tools::label(name, args), "output": output}));
+                messages.push(json!({"role": "tool", "tool_name": name, "content": output}));
+                if turn.interrupted {
+                    break;
+                }
+            }
+            if turn.interrupted {
+                break;
+            }
+            if round + 1 == MAX_ROUNDS {
+                turn.reply = "(stopped: too many tool rounds in one turn)".into();
+            }
         }
-        let reply = if reply.trim().is_empty() && interrupted { "…".to_string() } else { reply };
-        let thinking = Some(thinking.trim().to_string()).filter(|t| !t.is_empty());
-        self.store(text, &reply, thinking.as_deref())?;
-        Ok((reply, thinking, interrupted, stats))
+        if turn.reply.trim().is_empty() && turn.interrupted {
+            turn.reply = "…".into();
+        }
+        turn.thinking = Some(thinking.trim().to_string()).filter(|t| !t.is_empty());
+        self.store(text, &turn)?;
+        Ok((turn, stats))
     }
 }
 
@@ -301,8 +384,12 @@ type Shared = State<Arc<Agent>>;
 
 async fn get_history(State(agent): Shared) -> (StatusCode, Json<Value>) {
     match agent.history() {
-        Ok(rows) => (StatusCode::OK, Json(json!({"messages": rows.into_iter()
-            .map(|(m, at, thinking)| json!({"role": m.role, "content": m.content, "thinking": thinking, "at": at}))
+        Ok(rows) => (StatusCode::OK, Json(json!({
+            "context": context(rows.iter().rev().find_map(|r| r.ctx).map(|c| c as u64)),
+            "messages": rows.into_iter()
+            .map(|r| json!({"role": r.msg.role, "content": r.msg.content, "thinking": r.thinking, "at": r.at,
+                "tools": r.tools.and_then(|t| serde_json::from_str::<Value>(&t).ok()),
+                "steps": r.steps.and_then(|t| serde_json::from_str::<Value>(&t).ok())}))
             .collect::<Vec<_>>()}))),
         Err(e) => {
             error!(error = %e, "history read failed");
@@ -316,21 +403,31 @@ struct ChatIn {
     text: String,
 }
 
-async fn post_chat(State(agent): Shared, Json(req): Json<ChatIn>) -> (StatusCode, Json<Value>) {
-    let text = req.text.trim();
+/// POST /chat {"text"}: always answered with Server-Sent Events, one JSON event per `data:` line, plus a keep-alive
+/// comment every 15 s so a long turn never sits silent behind a proxy timeout. A message streams the turn (same
+/// events as voice mode: thinking_delta, reply_delta, tool_call, tool_result, then reply or error); a slash command
+/// sends one {"type":"note"} or error. A turn runs in its own task: if the client goes away it still finishes and is
+/// stored.
+async fn post_chat(State(agent): Shared, Json(req): Json<ChatIn>) -> Response {
+    let text = req.text.trim().to_string();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     if text.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "empty message"})));
+        let _ = tx.send(json!({"type": "error", "error": "empty message"}));
+    } else if text.starts_with('/') {
+        let _ = tx.send(match agent.command(&text).await {
+            Ok(note) => json!({"type": "note", "text": note}),
+            Err(e) => json!({"type": "error", "error": e}),
+        });
+    } else {
+        tokio::spawn(async move {
+            let result = agent.chat_stream(&text, &CancellationToken::new(), |d| { let _ = tx.send(delta_event(&d)); }).await;
+            let _ = tx.send(result.map_or_else(|e| json!({"type": "error", "error": e}), |t| reply_event(&t)));
+        });
     }
-    if text.starts_with('/') {
-        return match agent.command(text).await {
-            Ok(note) => (StatusCode::OK, Json(json!({"reply": note, "command": true}))),
-            Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e, "command": true}))),
-        };
-    }
-    match agent.chat(text).await {
-        Ok((reply, thinking)) => (StatusCode::OK, Json(json!({"reply": reply, "thinking": thinking}))),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))),
-    }
+    let events = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|v| (Ok::<_, std::convert::Infallible>(Event::default().data(v.to_string())), rx))
+    });
+    Sse::new(events).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))).into_response()
 }
 
 async fn serve(agent: Arc<Agent>) {
@@ -362,11 +459,16 @@ async fn terminal(agent: Arc<Agent>) {
                 Err(e) => eprintln!("{e}"),
             },
             _ => match agent.chat(text).await {
-                Ok((reply, thinking)) => {
-                    if let Some(t) = thinking {
-                        println!("\x1b[2;3m{t}\x1b[0m"); // dim italic
+                Ok(t) => {
+                    for step in &t.steps {
+                        let txt = |k: &str| step[k].as_str().unwrap_or("").to_string();
+                        match step["type"].as_str() {
+                            Some("thinking") => println!("\x1b[2;3m{}\x1b[0m", txt("text")), // dim italic
+                            Some("tool") => println!("\x1b[2m$ {}\n{}\x1b[0m", txt("command"), txt("output")),
+                            _ => println!("\x1b[2m{}\x1b[0m", txt("text")),
+                        }
                     }
-                    println!("max> {reply}")
+                    println!("max> {}", t.reply)
                 }
                 Err(e) => eprintln!("error: {e}"),
             },

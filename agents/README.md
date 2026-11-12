@@ -27,13 +27,30 @@ One binary, two modes:
 
 - `root` serves HTTP on `127.0.0.1:$ROOT_PORT` (default 8007):
   - `GET /history`: the whole conversation
-  - `POST /chat` `{"text"}`: one turn, returns `{"reply", "thinking"}`
+  - `POST /chat` `{"text"}`: one turn, streamed as Server-Sent Events (thinking, text, tool calls and results as
+    they happen, then the final reply) with a keep-alive every 15 s, so long tool runs survive proxy timeouts.
+    Slash commands answer with plain JSON.
   - `GET /voice`: WebSocket for voice mode (protocol documented at the top of [`voice.rs`](agents/root/src/voice.rs))
 - `root chat` is the same conversation as a terminal loop.
 
 Each turn sends the persona, the stored conversation and the new message to Ollama. The persona is read from
 `context/MAX.md` on every turn (kept out of the repo), so edits apply without a restart. History lives in SQLite at
-`agents/agents.db` (table `root`, also gitignored), including the model's thoughts, which are shown but not sent back.
+`agents/agents.db` (table `root`, also gitignored). Each reply is stored with its steps in order (thinking, text said
+before a tool call, tool calls with output) for the chat pane; only the final answer goes back into the model's
+context in later turns. The context window is 131,072 tokens (`NUM_CTX`), shown by a meter above the chat input.
+
+### Tools
+
+The model can call tools ([`tools.rs`](agents/root/src/tools.rs)) through Ollama's native tool calling, over the same
+plain HTTP as everything else (no SDK): each request carries the tool definitions, and when the reply contains
+`tool_calls` the agent runs them, sends the results back as `tool` messages and asks again, until the model answers
+without a call (at most 25 rounds per turn). Tool calls are stored with the reply and shown in the chat pane.
+
+| Tool | What it does |
+|---|---|
+| `bash` | Runs a command with `bash -c` in the home directory, no stdin, 120 s timeout; returns exit code, stdout and stderr |
+
+There is no sandbox yet: `bash` can do anything the agent's user can.
 
 ### Slash commands
 

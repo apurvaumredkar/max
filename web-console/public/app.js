@@ -167,14 +167,41 @@ placeRings();
 const log = document.getElementById('log'), chatIn = document.getElementById('chat-in');
 const chatBtn = document.querySelector('#chat-form button');
 
-function addMsg(role, text, cls = '', thinking = '') {
+// A tool call the model made: "$ command" and the start of its output.
+function toolBlock(command, output) {
+  const b = document.createElement('div');
+  b.className = 'tool';
+  const c = document.createElement('div');
+  c.className = 'cmd';
+  c.textContent = '$ ' + command;
+  const o = document.createElement('div');
+  b.append(c, o);
+  b.setOutput = text => {
+    const lines = String(text).trimEnd().split('\n');
+    o.textContent = lines.slice(0, 12).join('\n') + (lines.length > 12 ? '\n[+' + (lines.length - 12) + ' lines]' : '');
+  };
+  if (output !== undefined) b.setOutput(output);
+  return b;
+}
+
+// One step of a turn, as stored: thinking (grey italics), text said before a tool call, or a tool call.
+function stepNode(st) {
+  if (st.type === 'tool') return toolBlock(st.command, st.output);
+  const d = document.createElement('div');
+  d.className = st.type === 'thinking' ? 'think' : 'steptext';
+  d.textContent = (st.text || '').trim();
+  return d;
+}
+
+// A message. For replies, `extra` carries what happened before the answer: `steps` (in order), or for older rows
+// `thinking` and `tools`.
+function addMsg(role, text, cls = '', extra = {}) {
   const el = document.createElement('div');
   el.className = 'msg ' + role + (cls ? ' ' + cls : '');
-  if (thinking) {  // the model's thoughts, above its reply
-    const t = document.createElement('div');
-    t.className = 'think';
-    t.textContent = thinking.trim();
-    el.appendChild(t);
+  if (extra.steps) extra.steps.forEach(st => el.appendChild(stepNode(st)));
+  else {
+    if (extra.thinking) el.appendChild(stepNode({ type: 'thinking', text: extra.thinking }));
+    (extra.tools || []).forEach(t => el.appendChild(toolBlock(t.command, t.output)));
   }
   el.insertAdjacentHTML('beforeend', '<span class="who">' + (role === 'user' ? 'you' : 'max') + '&gt; </span>');
   // paragraphs (blank-line separated) get a half-line gap instead of a full empty line
@@ -208,35 +235,61 @@ document.getElementById('chat-form').addEventListener('submit', async e => {
   }
   chatIn.value = ''; grow();
   chatBtn.disabled = true;
-  const isCmd = text.startsWith('/');  // slash commands (e.g. /clear N) are handled by the agent, not the model
   addMsg('user', text);
-  const pending = addMsg('assistant', isCmd ? '...' : 'thinking ...', 'dim');
+  turnStart();
   try {
     const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
-    const raw = await r.text();
-    let d;
-    try { d = JSON.parse(raw); } catch (_) {
-      // not from the console (e.g. a Cloudflare error/login page): show status + page title
-      const title = (raw.match(/<title>([^<]*)<\/title>/i) || [])[1] || raw.slice(0, 80);
-      d = { error: 'HTTP ' + r.status + ' ' + title.trim() };
+    if (!(r.headers.get('content-type') || '').includes('text/event-stream')) {
+      // not the agent's stream (e.g. a Cloudflare error or login page): show status + page title
+      const raw = await r.text(), title = (raw.match(/<title>([^<]*)<\/title>/i) || [])[1] || raw.slice(0, 80);
+      throw new Error('HTTP ' + r.status + ' ' + title.trim());
     }
-    pending.remove();
-    if (d.error) addMsg('assistant', 'error: ' + d.error, 'err');
-    else if (d.command) { await loadHistory(); addMsg('assistant', d.reply, 'dim'); }  // history changed: redraw it
-    else addMsg('assistant', d.reply, '', d.thinking || '');
+    if (!await readEvents(r, turnEvent)) throw new Error('connection lost; the turn carries on in the agent, reload to see it');
   } catch (err) {
-    pending.remove();
-    addMsg('assistant', 'error: ' + err.message, 'err');
+    turnEvent({ type: 'error', error: err.message });
   }
   chatBtn.disabled = false;
   chatIn.focus();
 });
 
+// Read a Server-Sent Events response (one JSON event per "data:" line), calling onEvent for each. True if the stream
+// ended with a final event (reply, note or error).
+async function readEvents(r, onEvent) {
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '', ended = false;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return ended;
+    buf += dec.decode(value, { stream: true });
+    let cut;
+    while ((cut = buf.indexOf('\n\n')) >= 0) {
+      const data = buf.slice(0, cut).split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
+      buf = buf.slice(cut + 2);
+      if (!data) continue;  // keep-alive
+      const ev = JSON.parse(data);
+      if (['reply', 'note', 'error'].includes(ev.type)) ended = true;
+      onEvent(ev);
+    }
+  }
+}
+
+// Context meter above the input: tokens the conversation fills in the model's window, as of the last reply.
+function showContext(c) {
+  if (!c) return;
+  const k = n => (n / 1000).toFixed(1) + 'k';
+  const p = c.used == null ? 0 : Math.min(100, 100 * c.used / c.max);
+  const label = c.used == null ? 'context <span class="dim">known after the next reply</span>'
+    : 'context ' + Math.round(p) + '% <span class="dim">' + k(c.used) + ' / ' + k(c.max) + '</span>';
+  document.getElementById('ctx').innerHTML = '<span class="lead"></span>[ ' + label + ' ]' +
+    '<span class="track"><span class="fill" style="width:' + p.toFixed(1) + '%"></span></span>';
+}
+
 async function loadHistory() {
   try {
     const d = await (await fetch('/api/chat', { cache: 'no-store' })).json();
     log.textContent = '';
-    d.messages.forEach(m => addMsg(m.role, m.content, '', m.thinking || ''));
+    showContext(d.context);
+    d.messages.forEach(m => addMsg(m.role, m.content, '', m));
   } catch (e) {}
 }
 loadHistory();
@@ -332,7 +385,7 @@ function voiceStop(note) {
   if (voice.mic) voice.mic.getTracks().forEach(t => t.stop());
   if (voice.ctx) voice.ctx.close();
   voice.mic = voice.ctx = null; voice.playEnd = voice.quietUntil = 0; voice.sources = [];
-  if (voice.live) { voice.live.el.remove(); voice.live = null; }
+  if (turnLive) { turnLive.el.remove(); turnLive = null; }
   chatBox.dataset.title = 'Max';
   if (note) addMsg('assistant', note, 'dim');
 }
@@ -355,22 +408,24 @@ document.addEventListener('keydown', e => {
   voiceInterrupt();
 });
 
-// The reply being written: thoughts and text grow as deltas arrive; replaced by the finished message at the end.
-function liveMsg() {
+// The turn being written (typed or spoken): steps appear in order as events arrive. Text streams in after "max>";
+// if a tool call follows, that text was said on the way, so it moves up into the steps. The finished message
+// (from the "reply" event) replaces it all.
+let turnLive = null;
+
+function turnStart() {
   const el = document.createElement('div');
   el.className = 'msg assistant';
-  const think = document.createElement('div');
-  think.className = 'think';
-  think.style.display = 'none';
+  const steps = document.createElement('div');
   const body = document.createElement('span');
   body.className = 'dim';
   body.textContent = 'thinking ...';
-  el.appendChild(think);
+  el.appendChild(steps);
   el.insertAdjacentHTML('beforeend', '<span class="who">max&gt; </span>');
   el.appendChild(body);
   log.appendChild(el);
   log.scrollTop = log.scrollHeight;
-  return { el, think, body, started: false };
+  turnLive = { el, steps, body, started: false, cur: null, curType: null, lastTool: null };
 }
 
 function follow(fn) {  // keep the log pinned to the bottom if it was
@@ -379,33 +434,61 @@ function follow(fn) {  // keep the log pinned to the bottom if it was
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 
+function turnEvent(ev) {
+  const live = turnLive;
+  const flushBody = () => {  // text so far was said before a step: move it into the steps
+    if (live.started && live.body.textContent.trim()) live.steps.appendChild(stepNode({ type: 'text', text: live.body.textContent }));
+    live.started = false; live.body.className = 'dim'; live.body.textContent = 'working ...';
+  };
+  if (ev.type === 'thinking_delta' && live) follow(() => {
+    if (live.curType !== 'thinking') {
+      flushBody();
+      live.cur = stepNode({ type: 'thinking', text: '' }); live.curType = 'thinking';
+      live.steps.appendChild(live.cur);
+    }
+    live.cur.textContent += live.cur.textContent ? ev.text : ev.text.trimStart();
+  });
+  else if (ev.type === 'reply_delta' && live) follow(() => {
+    if (!live.started) { live.started = true; live.body.className = ''; live.body.textContent = ''; }
+    live.curType = 'text';
+    live.body.textContent += live.body.textContent ? ev.text : ev.text.trimStart();
+  });
+  else if (ev.type === 'tool_call' && live) follow(() => {
+    flushBody();
+    live.lastTool = toolBlock(ev.command);
+    live.lastTool.setOutput('running ...');
+    live.steps.appendChild(live.lastTool);
+    live.cur = live.lastTool; live.curType = 'tool';
+  });
+  else if (ev.type === 'tool_result' && live && live.lastTool) follow(() => live.lastTool.setOutput(ev.output));
+  else if (ev.type === 'reply') {
+    if (live) { live.el.remove(); turnLive = null; }
+    const el = addMsg('assistant', ev.text, '', ev);
+    showContext(ev.context);
+    if (ev.interrupted) el.insertAdjacentHTML('beforeend', ' <span class="dim">[cut off]</span>');
+  }
+  else if (ev.type === 'note') {  // a slash command's result; it may have changed the history (/clear), so redraw it
+    if (live) { live.el.remove(); turnLive = null; }
+    loadHistory().then(() => addMsg('assistant', ev.text, 'dim'));
+  }
+  else if (ev.type === 'error') {
+    if (live) { live.el.remove(); turnLive = null; }
+    addMsg('assistant', 'error: ' + ev.error, 'err');
+  }
+}
+
 function voiceEvent(ev) {
-  const live = voice.live;
   if (ev.type === 'ready') { voice.ready = true; addMsg('assistant', 'voice mode on: listening. Space cuts Max off; /voice to stop', 'dim'); }
   else if (ev.type === 'heard') {
     voice.busy = true; voice.drop = false;
     addMsg('user', ev.text);
-    voice.live = liveMsg();
+    turnStart();
   }
-  else if (ev.type === 'thinking_delta' && live) follow(() => {
-    live.think.style.display = '';
-    live.think.textContent += live.think.textContent ? ev.text : ev.text.trimStart();
-  });
-  else if (ev.type === 'reply_delta' && live) follow(() => {
-    if (!live.started) { live.started = true; live.body.className = ''; live.body.textContent = ''; }
-    live.body.textContent += live.body.textContent ? ev.text : ev.text.trimStart();
-  });
   else if (ev.type === 'speaking') voice.rate = ev.rate || 24000;
-  else if (ev.type === 'reply') {
-    if (live) { live.el.remove(); voice.live = null; }
-    const el = addMsg('assistant', ev.text, '', ev.thinking || '');
-    if (ev.interrupted) el.insertAdjacentHTML('beforeend', ' <span class="dim">[cut off]</span>');
-  }
   else if (ev.type === 'done') voice.busy = false;
-  else if (ev.type === 'error') {
-    if (live) { live.el.remove(); voice.live = null; }
-    voice.busy = false;
-    addMsg('assistant', 'error: ' + ev.error, 'err');
+  else {
+    if (ev.type === 'error') voice.busy = false;
+    turnEvent(ev);
   }
 }
 

@@ -4,7 +4,7 @@ Everything in public/ is served as-is. A tiny script is injected into HTML pages
 it listens on /__reload (SSE) and refreshes the page the moment any file in public/
 changes (CSS-only edits swap the stylesheet without a full reload).
 """
-import json, os, socket, subprocess, threading, time, urllib.error, urllib.request
+import json, os, socket, subprocess, threading, time, urllib.request
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -145,7 +145,7 @@ def poll_tailnet_inference():
         try:
             st = json.loads(subprocess.run(["tailscale", "status", "--json"], capture_output=True,
                                            text=True, timeout=10, check=True).stdout)
-            # match on the MagicDNS name: HostName is the OS display name (e.g. "Apurva’s MacBook Pro")
+            # match on the MagicDNS name (first label of DNSName): HostName is the OS display name, not the device name
             peers = {p.get("DNSName", "").split(".")[0].lower(): p for p in (st.get("Peer") or {}).values()}
             hosts = []
             if not inference_hosts():
@@ -203,21 +203,16 @@ def poll_openrouter():
         time.sleep(300)
 
 
-# Chat pane: forwarded to the Rust root agent (agents/root, user service max-root), which owns the model,
-# persona and history. The console only relays.
-ROOT_AGENT = "http://127.0.0.1:8007"
+# Chat pane: everything goes to the Rust root agent (agents/root, user service max-root), which owns the model,
+# persona, history and voice. The console only relays: GET /history as JSON, chat and voice as raw byte streams.
+ROOT_AGENT = ("127.0.0.1", 8007)
 
 
-def root_agent(path, payload=None):
-    req = urllib.request.Request(ROOT_AGENT + path, data=None if payload is None else json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+def root_history():
     try:
-        with urllib.request.urlopen(req, timeout=620) as r:
+        with urllib.request.urlopen("http://%s:%d/history" % ROOT_AGENT, timeout=15) as r:
             return json.load(r), 200
-    except urllib.error.HTTPError as e:
-        # 502/504 would be swapped for Cloudflare's own error page, hiding the agent's message; send 500 instead
-        return json.load(e), 500 if e.code in (502, 504) else e.code
-    except Exception as e:
+    except Exception as e:  # 500, never 502: Cloudflare would swap a 502 for its own page and hide the message
         return {"error": f"root agent unreachable: {e}"[:200]}, 500
 
 
@@ -276,22 +271,22 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if self.path.split("?")[0] != "/api/chat":
             return self.send_error(404)
-        try:
-            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        except ValueError:
-            return self.send_json({"error": "bad request"}, 400)
-        self.send_json(*root_agent("/chat", payload))
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        # the agent answers with a long-lived event stream: relay it as it arrives
+        self.relay(b"POST /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                   + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
 
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/__reload":
             return self.sse()
-        if path == "/api/voice":
-            return self.voice_relay()
+        if path == "/api/voice":  # WebSocket upgrade: forward the browser's request headers as they are
+            return self.relay(("GET /voice HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
+                               + "\r\n").encode())
         if path == "/api/logs":
             return self.logs_sse()
         if path == "/api/chat":
-            return self.send_json(*root_agent("/history"))
+            return self.send_json(*root_history())
         api = {"/api/stats": lambda: STATS, "/api/storage": storage, "/api/docker": lambda: DOCKER,
                "/api/tunnels": lambda: TUNNELS, "/api/gdrive": lambda: GDRIVE,
                "/api/inference": lambda: INFERENCE}
@@ -341,26 +336,25 @@ class Handler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def voice_relay(self):
-        """Voice mode WebSocket: hand the connection to the root agent's GET /voice and pipe bytes both ways untouched
-        (the agent does the WebSocket handshake and all voice work; the console just relays)."""
+    def relay(self, request):
+        """Send `request` (raw HTTP) to the root agent and pipe bytes both ways untouched until either side closes:
+        an event stream for chat, a WebSocket (the agent does the handshake) for voice."""
         try:
-            up = socket.create_connection(("127.0.0.1", 8007), timeout=5)
+            up = socket.create_connection(ROOT_AGENT, timeout=5)
         except OSError as e:
-            return self.send_json({"error": f"root agent unreachable: {e}"}, 503)
+            return self.send_json({"error": f"root agent unreachable: {e}"}, 500)
         up.settimeout(None)
-        head = "GET /voice HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in self.headers.items()) + "\r\n"
-        up.sendall(head.encode())
+        up.sendall(request)
 
         def pump(src, dst):
             try:
                 while chunk := src.recv(65536):
                     dst.sendall(chunk)
             except OSError:
-                pass
-            for s in (src, dst):  # one side ending ends both
+                pass  # e.g. the browser went away: a chat turn carries on in the agent
+            for sock in (src, dst):  # one side ending ends both
                 try:
-                    s.shutdown(socket.SHUT_RDWR)
+                    sock.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
 

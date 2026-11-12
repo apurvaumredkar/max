@@ -6,8 +6,9 @@
 //!   {"type":"ready"}                                  STT connected, start sending audio
 //!   {"type":"heard","text"}                           an utterance the STT finished (becomes the user turn)
 //!   {"type":"thinking_delta","text"} / {"type":"reply_delta","text"}   the turn as the model writes it
+//!   {"type":"tool_call","name","command"} / {"type":"tool_result","output"}   a tool the model ran (see tools.rs)
 //!   {"type":"speaking","rate":24000} then <PCM...>    Max's voice, sentence by sentence as the reply streams
-//!   {"type":"reply","text","thinking","interrupted"}  the finished (or cut) reply, as stored in agents.db
+//!   {"type":"reply","text","thinking","steps","interrupted","context"}  the finished (or cut) turn, as stored
 //!   {"type":"done"}                                   turn over: all audio sent
 //!   {"type":"error","error"}
 //!
@@ -30,7 +31,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::tungstenite::Message as SttMsg;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Agent, Delta};
+use crate::{Agent, Delta, delta_event, reply_event};
 
 pub const VOICE: &str = "Russell"; // Phonon catalog voice, American male
 
@@ -135,13 +136,21 @@ async fn turn(agent: &Agent, text: &str, out: &Out, cancel: &CancellationToken) 
     let (sentences, queue) = unbounded_channel::<String>();
     let model = async {
         let mut split = Splitter::default();
-        let result = agent.chat_stream(text, cancel, |d| match d {
-            Delta::Thinking(t) => event(out, json!({"type": "thinking_delta", "text": t})),
-            Delta::Content(c) => {
-                event(out, json!({"type": "reply_delta", "text": c}));
-                for s in split.push(c) {
-                    let _ = sentences.send(s);
+        let result = agent.chat_stream(text, cancel, |d| {
+            event(out, delta_event(&d));
+            match d {
+                Delta::Content(c) => {
+                    for s in split.push(c) {
+                        let _ = sentences.send(s);
+                    }
                 }
+                // text said before a tool call: speak what's pending now, don't run it into the next round's text
+                Delta::ToolCall { .. } => {
+                    if let Some(s) = split.flush() {
+                        let _ = sentences.send(s);
+                    }
+                }
+                _ => {}
             }
         }).await;
         if !cancel.is_cancelled() {
@@ -154,9 +163,7 @@ async fn turn(agent: &Agent, text: &str, out: &Out, cancel: &CancellationToken) 
     };
     let (result, ()) = tokio::join!(model, speaker(agent, queue, out, cancel));
     match result {
-        Ok((reply, thinking, interrupted)) => {
-            event(out, json!({"type": "reply", "text": reply, "thinking": thinking, "interrupted": interrupted}))
-        }
+        Ok(t) => event(out, reply_event(&t)),
         Err(e) => event(out, json!({"type": "error", "error": e})),
     }
 }
@@ -278,8 +285,14 @@ impl Splitter {
         None
     }
 
-    fn finish(self) -> Option<String> {
-        Some(self.buf.trim().to_string()).filter(|s| !s.is_empty())
+    /// Whatever is pending, as a final piece (the buffer is emptied).
+    fn flush(&mut self) -> Option<String> {
+        let s = std::mem::take(&mut self.buf);
+        Some(s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    fn finish(mut self) -> Option<String> {
+        self.flush()
     }
 }
 
