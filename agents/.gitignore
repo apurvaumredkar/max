@@ -1,0 +1,12 @@
+target/
+logs/
+agents.db
+agents.db-*
+
+# Python-era scratch, not part of the repo
+iris/
+lights.py
+lights.json
+*.ipynb
+.venv/
+__pycache__/

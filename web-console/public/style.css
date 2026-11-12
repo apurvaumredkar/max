@@ -1,0 +1,57 @@
+:root{
+  --bg:#000; --fg:#d8d8d8; --dim:#6b6b6b; --accent:#3b82f6; --ok:#4ade80; --bad:#f87171; --warn:#facc15;
+  --font:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:12.6px/1.4 var(--font)}
+body{padding:2.5vw 2.5vw 0 2.5vw}
+header{display:flex;align-items:flex-start;gap:2.5vw}
+/* chat fills the space left of the sections and the viewport height; stays put while the page scrolls */
+.chat{flex:1;min-width:0;position:sticky;top:2.5vw;height:calc(100vh - 5vw);display:flex;flex-direction:column;
+  border:1px dotted var(--dim);padding:.9rem 1rem .75rem}
+.chat::before{content:"[ " attr(data-title) " ]";position:absolute;top:-.75em;left:.75rem;padding:0 .35rem;background:var(--bg)}
+.log{flex:1;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding-bottom:.5rem}
+.log .msg{margin-bottom:.9rem}
+.log .para{display:block;margin-top:.45em}
+.log .think{color:var(--dim);font-style:italic;margin-bottom:.45em}
+.log .who{color:var(--dim)}
+.log .assistant .who{color:var(--accent)}
+.log .err{color:var(--bad)}
+.input{display:flex;align-items:flex-end;gap:.6rem;border-top:1px dotted var(--dim);padding-top:.75rem}
+.input textarea{flex:1;resize:none;overflow-y:auto;max-height:40vh;background:transparent;color:var(--fg);border:0;outline:0;
+  font:inherit;padding:.3rem 0;margin:0}
+.input textarea::placeholder{color:var(--dim)}
+.input button{flex:none;width:2rem;height:2rem;border:0;border-radius:0;background:var(--accent);color:#fff;font:bold 1.1rem/1 var(--font);
+  cursor:pointer;padding:0}
+.input button:disabled{opacity:.4;cursor:default}
+/* Logo overlaps the sections' top-right corner, poking out into the page padding by --out. It is a solid disc
+   (logo + --moat of page background) that hides whatever box border/text is under it. Each box draws the same
+   circle as a dotted ring (::after) and is clipped to its own rectangle, so the ring only shows where it passes
+   through a box: the box's border appears to curve around the logo, and nothing is drawn in the gaps or outside.
+   --y (box top within .side) is set by app.js. */
+.side{--logo:max(10vw, 64px);--moat:10.5px;--out:2.4vw;--d:calc(var(--logo) + 2 * var(--moat))}
+.logo{position:absolute;z-index:1;top:calc(1px - var(--out));right:calc(1px - var(--out));width:calc(var(--d) - 2px);
+  height:auto;padding:calc(var(--moat) - 1px);border-radius:50%;background:var(--bg)}
+.box::after{content:"";position:absolute;pointer-events:none;width:var(--d);height:var(--d);border:1px dotted var(--dim);
+  border-radius:50%;top:calc(-1px - var(--out) - var(--y, 0px));right:calc(-1px - var(--out))}
+pre{margin:0;font:inherit}
+.box{border:1px dotted var(--dim);padding:.5rem 1rem;white-space:pre}
+.box .bar{color:var(--accent)}
+.box .dim{color:var(--dim)}
+.side{position:relative;flex:none;width:78ch;max-width:100%;  /* fixed width so boxes don't resize as content changes */
+  height:calc(100vh - 5vw);display:flex;flex-direction:column}  /* same height as the chat; Logs takes what's left */
+.box{position:relative;padding-top:.9rem;margin-bottom:1.75rem;
+  clip-path:polygon(0 -1em, 50% -1em, 50% 0, 100% 0, 100% 100%, 0 100%)}  /* own rect + room for the title */
+.box[data-title]::before{content:"[ " attr(data-title) " ]";position:absolute;top:-.75em;left:.75rem;padding:0 .35rem;background:var(--bg);color:var(--fg)}
+.box .ok{color:var(--ok)}
+.box .bad{color:var(--bad)}
+.box .warn{color:var(--warn)}
+.box .tab{cursor:pointer;color:var(--dim)}
+.box .tab.on{color:var(--fg)}
+.box .tab:hover{color:var(--accent)}
+#logs{flex:1 1 0;min-height:calc(6 * 1.4em + 2rem);margin-bottom:0;display:flex;flex-direction:column}
+.loglines{flex:1;min-height:0;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.loglines .lv-ERROR{color:var(--bad)}
+.loglines .lv-WARN{color:var(--warn)}
+.loglines .lv-INFO{color:var(--ok)}
+.loglines .lv-DEBUG,.loglines .lv-TRACE{color:var(--dim)}

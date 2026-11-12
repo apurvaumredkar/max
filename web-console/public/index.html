@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Max Console</title>
+<link rel="icon" type="image/svg+xml" href="/assets/max.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <section class="chat" data-title="Max">
+    <div id="log" class="log"></div>
+    <form id="chat-form" class="input">
+      <textarea id="chat-in" rows="1" placeholder="message max" autofocus></textarea>
+      <button type="submit" aria-label="Send">&#8594;</button>
+    </form>
+  </section>
+  <div class="side">
+    <img class="logo" src="/assets/max.svg" alt="Max">
+    <pre id="mon" class="box" data-title="System">cpu [..........]   -%
+mem [..........]   -%</pre>
+    <pre id="disks" class="box" data-title="Storage">storage ...</pre>
+    <pre id="docker" class="box" data-title="Docker">docker ...</pre>
+    <pre id="inference" class="box" data-title="Inference">inference ...</pre>
+    <pre id="tunnels" class="box" data-title="Tunnels">tunnels ...</pre>
+    <div id="logs" class="box" data-title="Logs"><div class="loglines"><span class="dim">waiting for logs ...</span></div></div>
+  </div>
+</header>
+<script src="/app.js"></script>
+</body>
+</html>

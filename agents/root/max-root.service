@@ -1,0 +1,12 @@
+[Unit]
+Description=Max root agent (Rust; chat over HTTP on 127.0.0.1:8007)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/max/max/agents/root
+ExecStart=/home/max/max/agents/target/release/root
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

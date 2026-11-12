@@ -1,0 +1,13 @@
+# This folder holds several projects; the max repo (apurvaumredkar/max) tracks only agents/ and web-console/.
+/*
+!/.gitignore
+!/.env.example
+!/README.md
+!/agents/
+!/web-console/
+
+# never committed: host config, private docs (persona, ports, firewall notes), chat history
+.env
+/context/
+agents.db
+agents.db-*

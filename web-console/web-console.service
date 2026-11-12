@@ -1,0 +1,12 @@
+[Unit]
+Description=Max web console (static server with live reload)
+After=network.target
+
+[Service]
+WorkingDirectory=/home/max/max/web-console
+ExecStart=/usr/bin/python3 -u server.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
