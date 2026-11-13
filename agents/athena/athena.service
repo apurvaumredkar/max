@@ -1,0 +1,12 @@
+[Unit]
+Description=Athena, Max's email sub-agent (Rust; checks email-mcp, reports new mail to the root agent)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/max/max/agents/athena
+ExecStart=/home/max/max/agents/target/release/athena
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
