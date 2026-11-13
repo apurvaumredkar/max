@@ -73,44 +73,63 @@ async fn session(agent: Arc<Agent>, socket: WebSocket) {
     // the running turn's cancel token; an interrupt from the browser cancels it
     let current = Arc::new(Mutex::new(CancellationToken::new()));
 
-    // browser -> STT (mic) and interrupts
+    // browser -> STT (mic) and interrupts; returns why it stopped
     let mut mic = {
         let current = current.clone();
         tokio::spawn(async move {
-            while let Some(Ok(m)) = from_browser.next().await {
-                match m {
-                    Message::Binary(pcm) => {
-                        if to_stt.send(SttMsg::Binary(pcm)).await.is_err() {
-                            break;
+            let why = loop {
+                match from_browser.next().await {
+                    Some(Ok(Message::Binary(pcm))) => {
+                        if let Err(e) = to_stt.send(SttMsg::Binary(pcm)).await {
+                            break format!("STT stopped accepting audio: {e}");
                         }
                     }
-                    Message::Text(t) => {
+                    Some(Ok(Message::Text(t))) => {
                         let v: Value = serde_json::from_str(t.as_str()).unwrap_or_default();
                         if v["type"] == "interrupt" {
                             info!("voice: interrupted");
                             current.lock().unwrap().cancel();
                         }
                     }
-                    Message::Close(_) => break,
-                    _ => {}
+                    Some(Ok(Message::Close(f))) => break format!("browser closed the session ({f:?})"),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => break format!("browser connection error: {e}"),
+                    None => break "browser connection dropped".into(),
                 }
-            }
+            };
             let _ = to_stt.close().await;
+            why
         })
     };
+
+    // STT -> utterances. Read all the time, never only between turns: the STT server (uvicorn) pings every 20 s and
+    // drops a client that hasn't answered within 20 s, and pings are only answered while the stream is being read.
+    // (Reading only between turns cut every session whose turn ran past the next ping.)
+    let (utt_tx, mut utterances) = unbounded_channel::<String>();
+    let mut stt_reader = tokio::spawn(async move {
+        loop {
+            match from_stt.next().await {
+                Some(Ok(SttMsg::Text(t))) => {
+                    let text = serde_json::from_str::<Value>(t.as_str()).ok()
+                        .and_then(|v| v["text"].as_str().map(|s| s.trim().to_string()))
+                        .unwrap_or_default();
+                    if !text.is_empty() && utt_tx.send(text).is_err() {
+                        break "session over".to_string();
+                    }
+                }
+                Some(Ok(SttMsg::Close(f))) => break format!("STT closed the stream ({f:?})"),
+                Some(Ok(_)) => {} // pings: answered by tungstenite as we read
+                Some(Err(e)) => break format!("STT stream error: {e}"),
+                None => break "STT stream ended".into(),
+            }
+        }
+    });
 
     // utterances -> streamed turns -> speech, one at a time
     let turns = {
         let (agent, out, current) = (agent.clone(), out.clone(), current.clone());
         async move {
-            while let Some(Ok(m)) = from_stt.next().await {
-                let SttMsg::Text(t) = m else { continue };
-                let text = serde_json::from_str::<Value>(t.as_str()).ok()
-                    .and_then(|v| v["text"].as_str().map(|s| s.trim().to_string()))
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    continue;
-                }
+            while let Some(text) = utterances.recv().await {
                 let cancel = CancellationToken::new();
                 *current.lock().unwrap() = cancel.clone();
                 info!(chars = text.chars().count(), "voice: heard");
@@ -121,14 +140,30 @@ async fn session(agent: Arc<Agent>, socket: WebSocket) {
         }
     };
 
-    tokio::select! {
-        _ = &mut mic => {}                  // browser left (or STT stopped accepting audio)
-        _ = turns => { mic.abort(); }       // STT closed the stream
-    }
+    // The session ends when the browser side stops (the running turn is cut and its partial reply stored), or when the
+    // STT stream ends (the turn loop then runs out of utterances after finishing the one in progress).
+    let mut turns = tokio::spawn(turns);
+    let why = tokio::select! {
+        m = &mut mic => {
+            current.lock().unwrap().cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut turns).await;
+            turns.abort();
+            m.unwrap_or_else(|e| format!("mic task failed: {e}"))
+        }
+        _ = &mut turns => {
+            mic.abort();
+            (&mut stt_reader).await.unwrap_or_else(|e| format!("STT reader failed: {e}"))
+        }
+    };
+    stt_reader.abort();
     current.lock().unwrap().cancel();
     drop(out);
     let _ = writer.await;
-    info!("voice session ended");
+    if why.starts_with("browser closed") {
+        info!(why = %why, "voice session ended");
+    } else {
+        warn!(why = %why, "voice session ended");
+    }
 }
 
 /// One spoken turn: stream the reply, speaking each finished sentence while the rest is still being written.

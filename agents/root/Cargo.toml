@@ -11,6 +11,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 agentlog = { path = "../log" }
+board = { path = "../board" }
 futures-util = "0.3"
-tokio-tungstenite = "0.27"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] } # wss for the Discord gateway
 tokio-util = "0.7"

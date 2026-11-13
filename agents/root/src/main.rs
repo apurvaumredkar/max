@@ -1,5 +1,5 @@
-//! Root agent: chats with Ollama, using context/MAX.md as the persona and keeping the history in
-//! agents/agents.db (table `root`).
+//! Root agent: chats with Ollama, using context/agents/MAX.md as the persona and keeping the history in
+//! agents/memory/agents.db (table `root`).
 //!
 //!   root            HTTP service on 127.0.0.1:$ROOT_PORT (default 8007): GET /history, POST /chat {"text"}
 //!   root chat       the same conversation as a terminal loop (/exit or Ctrl-D to quit)
@@ -10,13 +10,18 @@
 //! Slash commands (web and terminal): /clear <N> deletes the last N turns from the history and the context;
 //! /think [on|off] toggles the model's thinking (on at start).
 //! /voice (web console only) opens a voice session on GET /voice (WebSocket): see voice.rs.
+//! /model (web console) picks the model: GET/POST /model, see model.rs; in the terminal /model shows the current one.
+//! Discord (served mode only): DMs and @mentions from allowed users run the same turn; see discord.rs.
 //!
 //! Logs (via the shared `agentlog` crate) go to agents/logs/agents.jsonl, which the web console streams.
 
+mod discord;
+mod model;
+mod push;
 mod tools;
 mod voice;
 
-use std::{path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Instant};
+use std::{path::PathBuf, sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Instant};
 
 use agentlog::{error, info};
 
@@ -30,23 +35,29 @@ use axum::{
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
+// Default model (Ollama at OLLAMA_URL) until one is picked with /model; the pick is kept in agents/memory/model.json.
 const MODEL: &str = "gemma4:e4b";
 const NUM_CTX: u32 = 131072; // gemma4:e4b full context
+static CTX_MAX: AtomicU64 = AtomicU64::new(NUM_CTX as u64); // the context meter's maximum: the current num_ctx
 
 struct Agent {
     home: PathBuf,
     db: PathBuf,
     persona: PathBuf,
-    chat_url: String,
+    sel: RwLock<model::Sel>,               // the model in use (see model.rs)
+    sel_path: PathBuf,
+    or_key: tokio::sync::Mutex<Option<String>>, // OpenRouter key, fetched from the secrets Worker on first use
     stt_url: String,
     tts_url: String,
     http: reqwest::Client,
     turn: tokio::sync::Mutex<()>, // one turn at a time so the history stays in order
     think: AtomicBool,            // model thinking on/off (/think); starts on, not kept across restarts
+    events: tokio::sync::broadcast::Sender<Value>, // live events for open web consoles (GET /events, see push.rs)
+    consoles: std::sync::Mutex<std::collections::HashMap<String, bool>>, // open console sessions -> focused
+    discord: RwLock<Option<(String, String)>>, // (auth header, channel) for sending to the user's channel, once connected
 }
 
 const MAX_ROUNDS: usize = 25; // model calls per turn (each tool round is one more)
@@ -57,6 +68,8 @@ pub(crate) enum Delta<'a> {
     Content(&'a str),
     ToolCall { name: &'a str, args: &'a Value },
     ToolResult { output: &'a str },
+    /// Structured data for the console's workspace panel (e.g. Athena's email list).
+    View(&'a Value),
 }
 
 /// A finished (or interrupted) turn. `reply` is the final answer only: it is all that goes back into the model's
@@ -80,6 +93,7 @@ pub(crate) fn delta_event(d: &Delta) -> Value {
         Delta::ToolResult { output } => {
             json!({"type": "tool_result", "output": output.chars().take(4000).collect::<String>()}) // pane shows the top
         }
+        Delta::View(v) => json!({"type": "view", "view": v}),
     }
 }
 
@@ -100,7 +114,7 @@ struct Row {
 
 /// Context meter for the chat pane: tokens used (None: not known yet) out of the window.
 pub(crate) fn context(used: Option<u64>) -> Value {
-    json!({"used": used, "max": NUM_CTX})
+    json!({"used": used, "max": CTX_MAX.load(Ordering::Relaxed)})
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -120,15 +134,25 @@ impl Agent {
         let need = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} must be set in max/.env (see .env.example)"));
         let base = need("OLLAMA_URL");
         let base = base.trim_end_matches('/').trim_end_matches("/v1").to_string();
+        let sel_path = home.join("agents/memory/model.json");
+        let sel = model::load(&sel_path).unwrap_or(model::Sel {
+            provider: "ollama".into(), host: "default".into(), base, model: MODEL.into(), num_ctx: NUM_CTX,
+        });
+        CTX_MAX.store(sel.num_ctx as u64, Ordering::Relaxed);
         Agent {
-            db: home.join("agents/agents.db"),
-            persona: home.join("context/MAX.md"),
-            chat_url: format!("{base}/api/chat"),
+            db: home.join("agents/memory/agents.db"), // agent memory lives in agents/memory/ (with the knowledge graph)
+            persona: home.join("context/agents/MAX.md"),
+            sel: RwLock::new(sel),
+            sel_path,
+            or_key: tokio::sync::Mutex::new(None),
             stt_url: need("STT_URL"),
             tts_url: need("TTS_URL"),
             http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build().unwrap(),
             turn: tokio::sync::Mutex::new(()),
             think: AtomicBool::new(true),
+            events: tokio::sync::broadcast::channel(64).0,
+            consoles: Default::default(),
+            discord: RwLock::new(None),
             home,
         }
     }
@@ -151,7 +175,37 @@ impl Agent {
         let _ = db.execute("ALTER TABLE root ADD COLUMN tools TEXT", []);
         let _ = db.execute("ALTER TABLE root ADD COLUMN ctx INTEGER", []);
         let _ = db.execute("ALTER TABLE root ADD COLUMN steps TEXT", []);
+        // sub-agents (athena, ...) leave reports here for the next turn; see `pending_reports`
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent TEXT NOT NULL,
+                text TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TEXT)",
+        )?;
+        db.busy_timeout(std::time::Duration::from_secs(10))?;
         Ok(db)
+    }
+
+    /// Sub-agent reports not yet passed to the model: (id, agent, created_at, text), oldest first.
+    fn pending_reports(&self) -> Result<Vec<(i64, String, String, String)>, String> {
+        let db = self.open().map_err(|e| e.to_string())?;
+        let mut st = db.prepare("SELECT id, agent, created_at, text FROM reports WHERE delivered_at IS NULL ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .and_then(|rows| rows.collect())
+            .map_err(|e| e.to_string())
+    }
+
+    fn mark_delivered(&self, ids: &[i64]) -> Result<(), String> {
+        let db = self.open().map_err(|e| e.to_string())?;
+        for id in ids {
+            db.execute("UPDATE reports SET delivered_at = CURRENT_TIMESTAMP WHERE id = ?1", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     /// Every stored message with its timestamp and, for replies, the model's thoughts and tool calls (JSON).
@@ -171,21 +225,47 @@ impl Agent {
         self.chat_stream(text, &CancellationToken::new(), |_| {}).await
     }
 
-    /// What the model sees for a turn: persona, the stored conversation, then `text`. Past thoughts and tool calls
-    /// are kept for display only and not sent back.
-    fn messages_for(&self, text: &str) -> Result<Vec<Value>, String> {
+    /// A turn from another channel (Discord): `note` is a system message about where Max is, sent just before
+    /// `text` in this turn only (not stored). `tools: false` is for messages that aren't from the user (another
+    /// agent, e.g. a Discord bot): same conversation, but the model gets no tools, so nothing in it can make Max
+    /// run a command.
+    pub(crate) async fn chat_from(&self, text: &str, note: &str, tools: bool) -> Result<Turn, String> {
+        self.chat_with(text, Some(note), tools, &CancellationToken::new(), |_| {}).await
+    }
+
+    /// What the model sees for a turn: persona, the stored conversation, any new sub-agent reports, then `text`.
+    /// Past thoughts and tool calls are kept for display only and not sent back; a report is shown in one turn only.
+    fn messages_for(&self, text: &str, reports: &[(i64, String, String, String)], note: Option<&str>)
+        -> Result<Vec<Value>, String> {
         let persona = std::fs::read_to_string(&self.persona)
             .map_err(|e| format!("{}: {e}", self.persona.display()))?;
         let mut messages = vec![json!({"role": "system", "content": persona})];
         messages.extend(self.history()?.into_iter().map(|r| json!({"role": r.msg.role, "content": r.msg.content})));
-        messages.push(json!({"role": "user", "content": text}));
+        if !reports.is_empty() {
+            let lines: Vec<String> = reports.iter().map(|(_, agent, at, t)| format!("[{agent}, {at} UTC] {t}")).collect();
+            messages.push(json!({"role": "system", "content": format!(
+                "Reports from your sub-agents since the user last spoke. Mention them briefly in your reply, before \
+                 or after answering the user's message:\n{}", lines.join("\n"))}));
+        }
+        match (note, text.is_empty()) {
+            // Max speaks on his own (push.rs): models answer a user turn, so the cue goes in one, marked as automatic
+            (Some(n), true) => messages.push(json!({"role": "user",
+                "content": format!("(Automatic message from Max's system, not typed by the user.) {n}")})),
+            (Some(n), false) => messages.push(json!({"role": "system", "content": n})),
+            (None, _) => {}
+        }
+        if !text.is_empty() {
+            messages.push(json!({"role": "user", "content": text}));
+        }
         Ok(messages)
     }
 
     fn store(&self, text: &str, turn: &Turn) -> Result<(), String> {
         let db = self.open().map_err(|e| e.to_string())?;
         let steps = (!turn.steps.is_empty()).then(|| Value::Array(turn.steps.clone()).to_string());
-        db.execute("INSERT INTO root (role, content) VALUES ('user', ?1)", [text]).map_err(|e| e.to_string())?;
+        if !text.is_empty() {
+            db.execute("INSERT INTO root (role, content) VALUES ('user', ?1)", [text]).map_err(|e| e.to_string())?;
+        }
         db.execute("INSERT INTO root (role, content, thinking, steps, ctx) VALUES ('assistant', ?1, ?2, ?3, ?4)",
                    rusqlite::params![turn.reply, turn.thinking, steps, turn.ctx.map(|c| c as i64)])
             .map_err(|e| e.to_string())?;
@@ -196,12 +276,17 @@ impl Agent {
     /// each round of calls is run and sent back until it answers without one (at most MAX_ROUNDS requests).
     /// Cancelling `cancel` stops generation or the running tool; the partial turn is stored, so the context matches
     /// what was said.
-    pub(crate) async fn chat_stream(&self, text: &str, cancel: &CancellationToken, mut on: impl FnMut(Delta))
+    pub(crate) async fn chat_stream(&self, text: &str, cancel: &CancellationToken, on: impl FnMut(Delta))
+        -> Result<Turn, String> {
+        self.chat_with(text, None, true, cancel, on).await
+    }
+
+    async fn chat_with(&self, text: &str, note: Option<&str>, tools: bool, cancel: &CancellationToken, mut on: impl FnMut(Delta))
         -> Result<Turn, String> {
         let _turn = self.turn.lock().await;
         let started = Instant::now();
-        info!(chars = text.chars().count(), "user message");
-        let result = self.turn_inner(text, cancel, &mut on).await;
+        info!(chars = text.chars().count(), tools, "user message");
+        let result = self.turn_inner(text, note, tools, cancel, &mut on).await;
         let ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok((t, stats)) => info!(ms, prompt_tokens = stats.0, reply_tokens = stats.1, chars = t.reply.chars().count(),
@@ -212,68 +297,52 @@ impl Agent {
         result.map(|(t, _)| t)
     }
 
-    async fn turn_inner(&self, text: &str, cancel: &CancellationToken, on: &mut impl FnMut(Delta))
+    async fn turn_inner(&self, text: &str, note: Option<&str>, tools: bool, cancel: &CancellationToken, on: &mut impl FnMut(Delta))
         -> Result<(Turn, (u64, u64)), String> {
-        let mut messages = self.messages_for(text)?;
+        let reports = self.pending_reports()?;
+        let mut messages = self.messages_for(text, &reports, note)?;
         let (mut turn, mut thinking, mut stats) = (Turn::default(), String::new(), (0, 0));
+        for (_, agent, _, t) in &reports {
+            turn.steps.push(json!({"type": "report", "agent": agent, "text": format!("{agent}: {t}")}));
+        }
         // Within the turn the model sees its own tool calls and results (`messages` grows); none of it is stored
         // as context: only `text` and the final `turn.reply` are, while `turn.steps` keeps it all for display.
+        // the model is fixed for the whole turn: a /model switch mid-turn applies from the next one
+        let sel = self.sel.read().unwrap().clone();
+        let openai = sel.provider == "openrouter"; // OpenAI-style tool messages instead of Ollama's
+        let specs = if tools { tools::specs(&self.db) } else { json!([]) };
         for round in 0..MAX_ROUNDS {
-            let req = self.http.post(&self.chat_url)
-                .json(&json!({"model": MODEL, "messages": messages, "tools": tools::specs(), "stream": true,
-                              "think": self.think.load(Ordering::Relaxed), "options": {"num_ctx": NUM_CTX}}))
-                .send();
-            let resp = tokio::select! {
-                r = req => r.map_err(|e| format!("ollama: {e}"))?,
-                _ = cancel.cancelled() => { turn.interrupted = true; break }
-            };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body: Value = resp.json().await.unwrap_or_default();
-                return Err(format!("ollama {status}: {}", body["error"].as_str().unwrap_or("?")));
-            }
-
-            // read the NDJSON stream: thinking/content pieces, tool calls, and the final stats line
-            let (mut body, mut line) = (resp.bytes_stream(), Vec::<u8>::new());
-            let (mut content, mut round_thinking, mut calls) = (String::new(), String::new(), Vec::<Value>::new());
-            loop {
-                let chunk = tokio::select! {
-                    c = body.next() => c,
-                    _ = cancel.cancelled() => { turn.interrupted = true; break } // dropping the stream stops Ollama
-                };
-                let Some(chunk) = chunk else { break };
-                line.extend_from_slice(&chunk.map_err(|e| format!("ollama: {e}"))?);
-                while let Some(end) = line.iter().position(|&b| b == b'\n') {
-                    let Ok(v) = serde_json::from_slice::<Value>(&line.drain(..=end).collect::<Vec<_>>()) else { continue };
-                    if let Some(e) = v["error"].as_str() {
-                        return Err(format!("ollama: {e}"));
-                    }
-                    let m = &v["message"];
-                    if let Some(t) = m["thinking"].as_str().filter(|t| !t.is_empty()) {
-                        round_thinking.push_str(t);
-                        on(Delta::Thinking(t));
-                    }
-                    if let Some(c) = m["content"].as_str().filter(|c| !c.is_empty()) {
-                        content.push_str(c);
-                        on(Delta::Content(c));
-                    }
-                    if let Some(tc) = m["tool_calls"].as_array() {
-                        calls.extend(tc.iter().cloned());
-                    }
-                    if v["done"].as_bool() == Some(true) {
-                        stats.0 += v["prompt_eval_count"].as_u64().unwrap_or(0);
-                        stats.1 += v["eval_count"].as_u64().unwrap_or(0);
-                        // last request wins: what the window held when the model finished
-                        turn.ctx = Some(v["prompt_eval_count"].as_u64().unwrap_or(0) + v["eval_count"].as_u64().unwrap_or(0));
-                    }
+            let think = self.think.load(Ordering::Relaxed);
+            let r = if openai {
+                let key = self.openrouter_key().await?;
+                let r = model::openrouter(&self.http, &key, &sel, &messages, &specs, think, cancel, &mut *on).await;
+                if r.as_ref().is_err_and(|e| e.contains("401") || e.contains("403")) {
+                    *self.or_key.lock().await = None; // re-fetch next time, in case the key was rotated
                 }
+                r?
+            } else {
+                match model::ollama(&self.http, &sel, &messages, &specs, think, cancel, &mut *on).await {
+                    // some models (e.g. llama3.1) can't think: ask again with thinking off rather than fail the turn
+                    Err(e) if think && e.contains("does not support thinking") => {
+                        model::ollama(&self.http, &sel, &messages, &specs, false, cancel, &mut *on).await?
+                    }
+                    r => r?,
+                }
+            };
+            stats.0 += r.prompt;
+            stats.1 += r.eval;
+            if r.prompt + r.eval > 0 {
+                turn.ctx = Some(r.prompt + r.eval); // last request wins: what the window held when the model finished
             }
+            turn.interrupted |= r.interrupted;
+            let (content, round_thinking, calls) = (r.content, r.thinking, r.calls);
             if !round_thinking.trim().is_empty() {
                 turn.steps.push(json!({"type": "thinking", "text": round_thinking.trim()}));
                 thinking.push_str(round_thinking.trim());
                 thinking.push_str("\n\n");
             }
-            if turn.interrupted || calls.is_empty() {
+            // a tool-less turn never runs a call, even one the model makes up
+            if turn.interrupted || calls.is_empty() || !tools {
                 turn.reply = content; // the final answer (or what was said before an interrupt)
                 break;
             }
@@ -288,12 +357,20 @@ impl Agent {
                 let args = &call["function"]["arguments"];
                 on(Delta::ToolCall { name, args });
                 let output = tokio::select! {
-                    o = tools::run(name, args) => o,
-                    _ = cancel.cancelled() => { turn.interrupted = true; "(interrupted)".to_string() }
+                    o = tools::run(name, args, &self.db) => o,
+                    _ = cancel.cancelled() => { turn.interrupted = true; String::from("(interrupted)").into() }
                 };
-                on(Delta::ToolResult { output: &output });
-                turn.steps.push(json!({"type": "tool", "name": name, "command": tools::label(name, args), "output": output}));
-                messages.push(json!({"role": "tool", "tool_name": name, "content": output}));
+                on(Delta::ToolResult { output: &output.text });
+                if let Some(v) = &output.view {
+                    on(Delta::View(v));
+                }
+                turn.steps.push(json!({"type": "tool", "name": name, "command": tools::label(name, args),
+                                       "output": output.text, "view": output.view}));
+                messages.push(if openai {
+                    json!({"role": "tool", "tool_call_id": call["id"], "content": output.text})
+                } else {
+                    json!({"role": "tool", "tool_name": name, "content": output.text})
+                });
                 if turn.interrupted {
                     break;
                 }
@@ -310,7 +387,33 @@ impl Agent {
         }
         turn.thinking = Some(thinking.trim().to_string()).filter(|t| !t.is_empty());
         self.store(text, &turn)?;
+        if !reports.is_empty() {
+            self.mark_delivered(&reports.iter().map(|r| r.0).collect::<Vec<_>>())?;
+            info!(reports = reports.len(), "sub-agent reports delivered");
+        }
         Ok((turn, stats))
+    }
+}
+
+impl Agent {
+    /// The OpenRouter key, fetched once from the secrets Worker and cached.
+    async fn openrouter_key(&self) -> Result<String, String> {
+        let mut k = self.or_key.lock().await;
+        if k.is_none() {
+            *k = Some(model::openrouter_key(&self.http).await?);
+        }
+        Ok(k.clone().unwrap())
+    }
+
+    /// Switch the model (from POST /model). Waits for a running turn to finish; kept in agents/memory/model.json.
+    async fn set_model(&self, sel: model::Sel) -> Result<model::Sel, String> {
+        sel.validate()?;
+        let _turn = self.turn.lock().await;
+        model::save(&self.sel_path, &sel)?;
+        CTX_MAX.store(sel.num_ctx as u64, Ordering::Relaxed);
+        info!(provider = %sel.provider, host = %sel.host, model = %sel.model, num_ctx = sel.num_ctx, "model set");
+        *self.sel.write().unwrap() = sel.clone();
+        Ok(sel)
     }
 }
 
@@ -341,7 +444,9 @@ impl Agent {
             }
             (Some("/think"), _, _) => Err("usage: /think [on|off]".into()),
             (Some("/voice"), _, _) => Err("voice mode runs in the web console's chat pane; type /voice there".into()),
-            (Some(cmd), _, _) => Err(format!("unknown command {cmd}; available: /clear <N>, /think [on|off], /voice")),
+            (Some("/model"), None, None) => Ok(format!("model: {} (pick another with /model in the web console)",
+                                                       self.sel.read().unwrap().label())),
+            (Some(cmd), _, _) => Err(format!("unknown command {cmd}; available: /clear <N>, /think [on|off], /model, /voice")),
             _ => Err("empty command".into()),
         }
     }
@@ -430,16 +535,54 @@ async fn post_chat(State(agent): Shared, Json(req): Json<ChatIn>) -> Response {
     Sse::new(events).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))).into_response()
 }
 
+/// GET /agents: every agent and how much of its context window is in use, for the console's Agents tab. Max: his
+/// conversation (tokens of his last turn, out of the window). Sub-agents (board registry): their latest model call,
+/// since each request starts a fresh window.
+async fn get_agents(State(agent): Shared) -> Json<Value> {
+    let max_ctx = agent.open().ok().and_then(|db| db.query_row(
+        "SELECT ctx, created_at FROM root WHERE ctx IS NOT NULL ORDER BY id DESC LIMIT 1", [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).ok());
+    let sel = agent.sel.read().unwrap().clone();
+    let mut list = vec![json!({"name": "max", "role": "orchestrator: talks to you, hands tasks to his sub-agents",
+        "online": true, "model": sel.model, "ctx_used": max_ctx.as_ref().map(|c| c.0), "ctx_max": sel.num_ctx,
+        "ctx_at": max_ctx.map(|c| c.1), "window": "conversation"})];
+    if let Ok(c) = board::open(&agent.db) {
+        for mut a in board::agents_status(&c).unwrap_or_default() {
+            a["window"] = json!("per request");
+            list.push(a);
+        }
+    }
+    Json(json!({"agents": list}))
+}
+
+/// GET /model: the model in use. POST /model {provider, host, base, model, num_ctx}: switch to another.
+async fn get_model(State(agent): Shared) -> Json<Value> {
+    Json(json!(*agent.sel.read().unwrap()))
+}
+
+async fn post_model(State(agent): Shared, Json(sel): Json<model::Sel>) -> (StatusCode, Json<Value>) {
+    match agent.set_model(sel).await {
+        Ok(s) => (StatusCode::OK, Json(json!({"ok": true, "current": s, "note": format!("model: {}", s.label())}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+    }
+}
+
 async fn serve(agent: Arc<Agent>) {
-    let agent_url = agent.chat_url.clone();
+    let current = agent.sel.read().unwrap().label();
+    tokio::spawn(discord::run(agent.clone()));
     let port = std::env::var("ROOT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8007u16);
+    tokio::spawn(push::watch(agent.clone()));
     let app = Router::new()
         .route("/history", get(get_history))
         .route("/chat", post(post_chat))
         .route("/voice", get(voice::upgrade))
+        .route("/model", get(get_model).post(post_model))
+        .route("/agents", get(get_agents))
+        .route("/events", get(push::events))
+        .route("/presence", post(push::presence))
         .with_state(agent);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
-    info!(port, model = MODEL, ollama = %agent_url, "listening");
+    info!(port, model = %current, "listening");
     axum::serve(listener, app).await.unwrap();
 }
 
