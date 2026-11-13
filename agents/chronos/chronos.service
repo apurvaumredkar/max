@@ -1,0 +1,12 @@
+[Unit]
+Description=Chronos, Max's time-keeping sub-agent (Rust; reminders, cron jobs, Apple Calendar; reports to the root agent)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/max/max/agents/chronos
+ExecStart=/home/max/max/agents/target/release/chronos
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
