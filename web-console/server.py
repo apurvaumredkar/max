@@ -4,7 +4,7 @@ Everything in public/ is served as-is. A tiny script is injected into HTML pages
 it listens on /__reload (SSE) and refreshes the page the moment any file in public/
 changes (CSS-only edits swap the stylesheet without a full reload).
 """
-import json, os, socket, subprocess, threading, time, urllib.request
+import json, os, socket, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -203,6 +203,89 @@ def poll_openrouter():
         time.sleep(300)
 
 
+# Model picker (/model in the chat pane): every model Max could run on, grouped by where it runs. Ollama hosts are the
+# inference boxes found by poll_tailnet_inference; OpenRouter lists what the API key may use (account settings such as
+# zero data retention applied), kept to models that take tools (Max needs them). The choice itself is the root agent's
+# (GET/POST /model there).
+OPENROUTER_MODELS = {"at": 0, "models": []}
+
+
+def ollama_bases():
+    return {h["label"]: f"http://{h['ip']}:11434" for h in INFERENCE["hosts"] if h.get("ip") and h.get("ollama")}
+
+
+def models_list():
+    groups = []
+    for label, base in ollama_bases().items():
+        try:
+            with urllib.request.urlopen(base + "/api/tags", timeout=5) as r:
+                tags = json.load(r).get("models", [])
+            models = [{"name": m["name"], "size": m.get("size", 0), "params": m.get("details", {}).get("parameter_size", ""),
+                       "quant": m.get("details", {}).get("quantization_level", "")}
+                      for m in tags if "embed" not in m["name"]]
+            groups.append({"label": label, "provider": "ollama", "base": base,
+                           "models": sorted(models, key=lambda m: m["name"])})
+        except Exception as e:
+            groups.append({"label": label, "provider": "ollama", "base": base, "models": [], "error": str(e)[:120]})
+    if time.time() - OPENROUTER_MODELS["at"] > 600:
+        try:
+            # /models/user: only what this key may use under the account's settings (zero data retention filters
+            # out providers that keep prompts). Never fall back to the public list: it has models ZDR would refuse.
+            OPENROUTER_MODELS["key"] = OPENROUTER_MODELS.get("key") or get_secret("OPENROUTER_API_KEY")
+            req = urllib.request.Request("https://openrouter.ai/api/v1/models/user",
+                                         headers={"User-Agent": "max-web-console",
+                                                  "Authorization": "Bearer " + OPENROUTER_MODELS["key"]})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)["data"]
+            data = [m for m in data if not m["id"].endswith(":batch")]  # batch endpoints: not for live chat
+            OPENROUTER_MODELS.update(at=time.time(), error=None, models=sorted((
+                {"name": m["id"], "ctx": m.get("context_length") or 0,  # prices: USD per million tokens
+                 "price": round(float(m.get("pricing", {}).get("prompt") or 0) * 1e6, 3),
+                 "price_out": round(float(m.get("pricing", {}).get("completion") or 0) * 1e6, 3)}
+                for m in data if "tools" in (m.get("supported_parameters") or [])), key=lambda m: m["name"]))
+        except Exception as e:
+            if getattr(e, "code", None) in (401, 403):
+                OPENROUTER_MODELS["key"] = None  # re-fetch in case the key was rotated
+            OPENROUTER_MODELS.update(models=[], error=str(e)[:120])  # no list rather than an unfiltered one
+    groups.append({"label": "openrouter", "provider": "openrouter", "base": "https://openrouter.ai/api/v1",
+                   "models": OPENROUTER_MODELS["models"], "error": OPENROUTER_MODELS.get("error")})
+    current, _ = root_call("GET", "/model")
+    return {"current": current, "groups": groups}
+
+
+def model_info(query):
+    """Max context and capabilities of one Ollama model (/api/show), for the context slider."""
+    q = urllib.parse.parse_qs(query)
+    base, model = q.get("base", [""])[0], q.get("model", [""])[0]
+    if base not in ollama_bases().values():  # only the known inference boxes
+        return {"error": "unknown host"}
+    try:
+        req = urllib.request.Request(base + "/api/show", json.dumps({"model": model}).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.load(r)
+        ctx = next((v for k, v in d.get("model_info", {}).items() if k.endswith(".context_length")), 0)
+        return {"ctx": ctx, "capabilities": d.get("capabilities", [])}
+    except Exception as e:
+        return {"error": str(e)[:160]}
+
+
+def root_call(method, path, body=None):
+    """A small JSON call to the root agent: (json, status)."""
+    try:
+        req = urllib.request.Request("http://%s:%d%s" % (ROOT_AGENT + (path,)), body, method=method,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r), 200
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e), 400
+        except Exception:
+            return {"error": f"root agent: {e}"[:200]}, 500
+    except Exception as e:
+        return {"error": f"root agent unreachable: {e}"[:200]}, 500
+
+
 # Chat pane: everything goes to the Rust root agent (agents/root, user service max-root), which owns the model,
 # persona, history and voice. The console only relays: GET /history as JSON, chat and voice as raw byte streams.
 ROOT_AGENT = ("127.0.0.1", 8007)
@@ -217,6 +300,22 @@ def root_history():
 
 
 AGENT_LOG = Path(__file__).resolve().parent.parent / "agents/logs/agents.jsonl"  # written by agents/log (agentlog)
+MAX = Path(__file__).resolve().parent.parent
+CONTEXT, GRAPH, KG = MAX / "context", MAX / "agents/memory/graph.json", MAX / "agents/target/release/kg"
+
+
+def graph():
+    """Knowledge graph of context/ (agents/kg). Rebuilt first whenever a context file, or the folder itself
+    (a file added or removed), is newer than the graph."""
+    try:
+        newest = max([CONTEXT.stat().st_mtime] + [f.stat().st_mtime for f in CONTEXT.iterdir() if f.is_file()])
+        if not GRAPH.exists() or GRAPH.stat().st_mtime < newest:
+            r = subprocess.run([str(KG)], capture_output=True, text=True, timeout=30)
+            if r.returncode:
+                raise RuntimeError("kg: " + (r.stderr.strip() or r.stdout.strip())[-160:])
+        return json.loads(GRAPH.read_text())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        return {"error": f"no graph: {e}"[:200], "nodes": [], "edges": []}
 
 
 def storage():
@@ -269,6 +368,20 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path.split("?")[0] == "/api/model":  # model picker's choice -> root agent
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            return self.send_json(*root_call("POST", "/model", body))
+        if self.path.split("?")[0] == "/api/presence":  # this tab gained/lost focus -> root agent (push.rs)
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            try:
+                req = urllib.request.Request("http://%s:%d/presence" % ROOT_AGENT, body, method="POST",
+                                             headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=5).close()
+            except Exception:
+                pass
+            self.send_response(204)
+            self.end_headers()
+            return
         if self.path.split("?")[0] != "/api/chat":
             return self.send_error(404)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -285,11 +398,20 @@ class Handler(SimpleHTTPRequestHandler):
                                + "\r\n").encode())
         if path == "/api/logs":
             return self.logs_sse()
+        if path == "/api/events":  # live pushes from the root agent (Max's own messages, sub-agent reports): raw relay
+            query = self.path.partition("?")[2]
+            return self.relay(f"GET /events?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode())
         if path == "/api/chat":
             return self.send_json(*root_history())
+        if path == "/api/agents":  # the Agents tab: each agent's status and context use
+            return self.send_json(*root_call("GET", "/agents"))
+        if path == "/api/models":
+            return self.send_json(models_list())
+        if path == "/api/models/info":
+            return self.send_json(model_info(self.path.partition("?")[2]))
         api = {"/api/stats": lambda: STATS, "/api/storage": storage, "/api/docker": lambda: DOCKER,
                "/api/tunnels": lambda: TUNNELS, "/api/gdrive": lambda: GDRIVE,
-               "/api/inference": lambda: INFERENCE}
+               "/api/inference": lambda: INFERENCE, "/api/graph": graph}
         if path in api:
             body = json.dumps(api[path]()).encode()
             self.send_response(200)

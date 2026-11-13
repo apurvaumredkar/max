@@ -9,16 +9,30 @@
 </head>
 <body>
 <header>
-  <section class="chat" data-title="Max">
-    <div id="log" class="log"></div>
-    <div id="ctx" class="ctxmeter"></div>
-    <form id="chat-form" class="input">
-      <textarea id="chat-in" rows="1" placeholder="message max" autofocus></textarea>
-      <button type="submit" aria-label="Send">&#8594;</button>
-    </form>
+  <section class="chat">
+    <img class="logo" src="/assets/max.svg" alt="Max">
+    <div class="ring"></div>
+    <div id="panetabs" class="panetabs"></div>
+    <div id="pane-chat" class="pane">
+      <div id="log" class="log"></div>
+      <div id="picker" class="picker" hidden></div>
+      <div id="ctx" class="ctxmeter"></div>
+      <form id="chat-form" class="input">
+        <textarea id="chat-in" rows="1" placeholder="message max" autofocus></textarea>
+        <button type="submit" aria-label="Send">&#8594;</button>
+      </form>
+    </div>
   </section>
   <div class="side">
-    <img class="logo" src="/assets/max.svg" alt="Max">
+    <div id="sidetabs" class="panetabs"></div>
+    <div id="workspace" class="box workspace">
+      <div id="view-graph" class="wview">
+        <svg id="graph" class="graph"></svg>
+        <div id="ginfo" class="ginfo"></div>
+      </div>
+      <div id="view-agents" class="wview agents" hidden><div class="empty">loading agents ...</div></div>
+      <div id="view-agent" class="wview mail" hidden><div class="empty">Nothing here yet. Ask Max for your email or your schedule, and what his agents fetch shows up here.</div></div>
+    </div>
     <pre id="mon" class="box" data-title="System">cpu [..........]   -%
 mem [..........]   -%</pre>
     <pre id="disks" class="box" data-title="Storage">storage ...</pre>

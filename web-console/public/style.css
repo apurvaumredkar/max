@@ -1,15 +1,14 @@
 :root{
-  --bg:#000; --fg:#d8d8d8; --dim:#6b6b6b; --accent:#3b82f6; --ok:#4ade80; --bad:#f87171; --warn:#facc15;
+  --bg:#000; --fg:#d8d8d8; --dim:#6b6b6b; --accent:#3b82f6; --ok:#4ade80; --bad:#f87171; --warn:#facc15; --violet:#a78bfa;
   --font:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:12.6px/1.4 var(--font)}
-body{padding:2.5vw 2.5vw 0 2.5vw}
-header{display:flex;align-items:flex-start;gap:2.5vw}
-/* chat fills the space left of the sections and the viewport height; stays put while the page scrolls */
-.chat{flex:1;min-width:0;position:sticky;top:2.5vw;height:calc(100vh - 5vw);display:flex;flex-direction:column;
+body{padding:1.25vw 1.25vw 0 1.25vw}  /* page margin = the gap between the columns */
+header{display:flex;flex-direction:row-reverse;align-items:flex-start;gap:1.25vw}  /* sections on the left, chat on the right */
+/* chat and sections split the width 50/50; chat fills the viewport height and stays put while the page scrolls */
+.chat{flex:1 1 0;min-width:0;position:sticky;top:1.25vw;height:calc(100vh - 2.5vw);display:flex;flex-direction:column;
   border:1px dotted var(--dim);padding:.9rem 1rem .75rem}
-.chat::before{content:"[ " attr(data-title) " ]";position:absolute;top:-.75em;left:.75rem;padding:0 .35rem;background:var(--bg)}
 .log{flex:1;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding-bottom:.5rem}
 .log .msg{margin-bottom:.9rem}
 .log .para{display:block;margin-top:.45em}
@@ -20,6 +19,28 @@ header{display:flex;align-items:flex-start;gap:2.5vw}
 .log .who{color:var(--dim)}
 .log .assistant .who{color:var(--accent)}
 .log .err{color:var(--bad)}
+/* sub-agents: indented under Max's turn, "<name>>" in the agent's colour (Chronos white, Athena violet) */
+.log .sub{margin:0 0 .45em 2ch;padding-left:.6em;border-left:1px dotted var(--dim)}
+.log .sub .req{color:var(--dim)}
+.log .sub.chronos .who{color:#fff}
+.log .sub.athena .who{color:var(--violet)}
+/* /model picker: replaces the message log while open (list of models, then the context slider) */
+.picker{flex:1;min-height:0;overflow-y:auto;white-space:pre;padding-bottom:.5rem}
+.picker[hidden]{display:none}
+.picker .phead{margin-bottom:.4rem}
+.picker .pfilter{margin-bottom:.2rem}
+.picker .caret{color:var(--accent);animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.picker .pgroup{color:var(--accent);margin-top:.7rem}
+.picker .prow{display:flex;gap:1.2rem;cursor:pointer}
+.picker .prow .pm{color:var(--accent);width:2ch;flex:none}
+.picker .prow .pn{min-width:30ch}
+.picker .prow.on{background:#16202f}
+.picker .prow:hover .pn{color:var(--accent)}
+.picker .dim{color:var(--dim)}
+.picker .err{color:var(--bad)}
+.picker .pslider{margin:1.2rem 0 .5rem}
+.picker input[type=range]{width:100%;accent-color:var(--accent)}
 /* context meter = the divider above the input: a dotted line with a title like the section boxes, filled in blue */
 .ctxmeter{display:flex;align-items:center;gap:.35rem;margin-top:.5rem;white-space:pre}
 .ctxmeter .lead{flex:none;width:.75rem;border-top:1px dotted var(--dim)}
@@ -33,24 +54,27 @@ header{display:flex;align-items:flex-start;gap:2.5vw}
 .input button{flex:none;width:2rem;height:2rem;border:0;border-radius:0;background:var(--accent);color:#fff;font:bold 1.1rem/1 var(--font);
   cursor:pointer;padding:0}
 .input button:disabled{opacity:.4;cursor:default}
-/* Logo overlaps the sections' top-right corner, poking out into the page padding by --out. It is a solid disc
-   (logo + --moat of page background) that hides whatever box border/text is under it. Each box draws the same
-   circle as a dotted ring (::after) and is clipped to its own rectangle, so the ring only shows where it passes
-   through a box: the box's border appears to curve around the logo, and nothing is drawn in the gaps or outside.
-   --y (box top within .side) is set by app.js. */
-.side{--logo:max(10vw, 64px);--moat:10.5px;--out:2.4vw;--d:calc(var(--logo) + 2 * var(--moat))}
-.logo{position:absolute;z-index:1;top:calc(1px - var(--out));right:calc(1px - var(--out));width:calc(var(--d) - 2px);
+/* Logo overlaps the chat pane's top-right corner, poking out into the page padding by --out. It is a solid disc
+   (logo + --moat of page background) that hides whatever border/text is under it. .ring is a layer the size of the
+   chat box that clips the same circle drawn as a dotted ring (::after), so the ring only shows inside the chat box:
+   its border appears to curve around the logo, and nothing is drawn outside it. */
+.chat{--logo:max(10vw, 64px);--moat:10.5px;--out:1.2vw;--d:calc(var(--logo) + 2 * var(--moat))}
+.logo{position:absolute;z-index:2;top:calc(-1 * var(--out));right:calc(-1 * var(--out));width:calc(var(--d) - 2px);
   height:auto;padding:calc(var(--moat) - 1px);border-radius:50%;background:var(--bg)}
-.box::after{content:"";position:absolute;pointer-events:none;width:var(--d);height:var(--d);border:1px dotted var(--dim);
-  border-radius:50%;top:calc(-1px - var(--out) - var(--y, 0px));right:calc(-1px - var(--out))}
+/* With a small --out the circle no longer reaches the chat box's corner; blank the corner up to the circle's centre
+   lines. Inside the circle the logo disc already covers everything, so this only removes the border outside it. */
+.chat::before{content:"";position:absolute;z-index:1;top:-1px;right:-1px;pointer-events:none;background:var(--bg);
+  width:calc(var(--d) / 2 - var(--out) + 1px);height:calc(var(--d) / 2 - var(--out) + 1px)}
+.ring{position:absolute;inset:-1px;overflow:hidden;pointer-events:none;z-index:1}
+.ring::after{content:"";position:absolute;width:var(--d);height:var(--d);border:1px dotted var(--dim);border-radius:50%;
+  top:calc(-1px - var(--out));right:calc(-1px - var(--out))}
 pre{margin:0;font:inherit}
 .box{border:1px dotted var(--dim);padding:.5rem 1rem;white-space:pre}
 .box .bar{color:var(--accent)}
 .box .dim{color:var(--dim)}
-.side{position:relative;flex:none;width:78ch;max-width:100%;  /* fixed width so boxes don't resize as content changes */
-  height:calc(100vh - 5vw);display:flex;flex-direction:column}  /* same height as the chat; Logs takes what's left */
-.box{position:relative;padding-top:.9rem;margin-bottom:1.75rem;
-  clip-path:polygon(0 -1em, 50% -1em, 50% 0, 100% 0, 100% 100%, 0 100%)}  /* own rect + room for the title */
+.side{position:relative;flex:1 1 0;min-width:0;  /* half the width, like the chat: boxes don't resize as content changes */
+  height:calc(100vh - 2.5vw);display:flex;flex-direction:column}  /* same height as the chat; Logs takes what's left */
+.box{position:relative;padding-top:.9rem;margin-bottom:1.75rem}
 .box[data-title]::before{content:"[ " attr(data-title) " ]";position:absolute;top:-.75em;left:.75rem;padding:0 .35rem;background:var(--bg);color:var(--fg)}
 .box .ok{color:var(--ok)}
 .box .bad{color:var(--bad)}
@@ -58,9 +82,81 @@ pre{margin:0;font:inherit}
 .box .tab{cursor:pointer;color:var(--dim)}
 .box .tab.on{color:var(--fg)}
 .box .tab:hover{color:var(--accent)}
+/* Left column tabs: Monitor (the status boxes) and Graph (Max's workspace, covering the whole column). The tabs sit on
+   the workspace's top border; in Monitor the boxes start one gap lower so the tabs float above the System box. The
+   boxes keep updating while hidden. */
+.side > .panetabs{z-index:2}
+.workspace{position:absolute;inset:0;z-index:1;margin:0;display:flex;flex-direction:column;white-space:normal;
+  background:var(--bg)}
+.side:not(.monitor) > .box:not(.workspace){visibility:hidden}
+.side.monitor{padding-top:1.75rem}
+.side.monitor > .workspace{display:none}
+/* workspace views: one shown at a time (graph, or what Max's agents put there, like Athena's email list) */
+.wview{flex:1;min-height:0;display:flex;flex-direction:column}
+.wview[hidden]{display:none}
+.mail{overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.mail .head{color:var(--dim);padding-bottom:.6rem;margin-bottom:.6rem;border-bottom:1px dotted var(--dim)}
+.mail .head .k{color:var(--accent)}
+.mail .row{display:grid;grid-template-columns:2.5ch 1fr;column-gap:.6rem;padding:.45rem 0;border-bottom:1px dotted #2a2a2a}
+.mail .n{color:var(--dim);text-align:right}
+.mail .top{display:flex;gap:1rem;justify-content:space-between}
+.mail .from{color:var(--fg)}
+.mail .when{color:var(--dim);flex:none}
+.mail .subj{color:var(--fg)}
+.mail .unread .subj{font-weight:bold}
+.mail .unread .n{color:var(--accent)}
+.mail .prev{color:var(--dim)}
+.mail .empty{color:var(--dim)}
+.mail .bad{color:var(--bad)}
+.mail .dim{color:var(--dim)}
+/* Chronos' schedule (same rows as the mail list) */
+.mail .sect{color:var(--accent);margin-top:.9rem}
+.mail .day{color:var(--fg);margin-top:.6rem;padding-bottom:.15rem;border-bottom:1px dotted var(--dim)}
+.mail .off{opacity:.45}
 #logs{flex:1 1 0;min-height:calc(6 * 1.4em + 2rem);margin-bottom:0;display:flex;flex-direction:column}
 .loglines{flex:1;min-height:0;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 .loglines .lv-ERROR{color:var(--bad)}
 .loglines .lv-WARN{color:var(--warn)}
 .loglines .lv-INFO{color:var(--ok)}
 .loglines .lv-DEBUG,.loglines .lv-TRACE{color:var(--dim)}
+/* chat pane title ("Chat", "· voice" while voice mode is on), sitting on the top border like the section titles */
+.panetabs{position:absolute;top:-.75em;left:.75rem;padding:0 .35rem;background:var(--bg);white-space:pre;cursor:pointer}
+.panetabs .tab{color:var(--dim)}
+.panetabs .tab.on{color:var(--fg)}
+.panetabs .tab:hover{color:var(--accent)}
+.pane{flex:1;min-height:0;display:flex;flex-direction:column}
+.pane[hidden]{display:none}
+/* knowledge graph of context/, in the workspace */
+.graph{flex:1;min-height:0;width:100%}
+.graph line{stroke:var(--dim);stroke-opacity:.45;stroke-width:1}
+.graph line.mentions{stroke-dasharray:2 4;stroke-opacity:.18}
+.graph line.hot{stroke:var(--accent);stroke-opacity:.9}
+.graph line.mentions.hot{stroke-opacity:.6}
+.graph .faded-line{stroke-opacity:.06}
+.graph text{fill:var(--fg);font:11px var(--font);pointer-events:none}
+.graph text.rel{fill:var(--accent);font-size:10px;paint-order:stroke;stroke:var(--bg);stroke-width:3px}
+.graph .node circle,.graph .node rect{stroke:var(--bg);stroke-width:2px}
+.graph .node{cursor:pointer}
+.graph .node.faded{opacity:.18}
+.graph .node.on text{fill:var(--accent)}
+.graph .t-doc{fill:var(--fg)} .graph .t-section{fill:var(--dim)} .graph .t-service{fill:var(--accent)}
+.graph .t-term{fill:var(--violet)}
+.ginfo{white-space:pre-wrap;border-top:1px dotted var(--dim);padding-top:.5rem;min-height:calc(6 * 1.4em);max-height:35%;overflow-y:auto}
+.ginfo .dim{color:var(--dim)}
+.ginfo .k{color:var(--accent)}
+.ginfo .bad{color:var(--bad)}
+.ginfo .sw{font-size:1.1em}
+/* Agents tab: one card per agent, a context bar like the chat's meter */
+.agents{overflow-y:auto;white-space:normal}
+.agents .agent{padding:.6rem 0;border-bottom:1px dotted #2a2a2a}
+.agents .top{display:flex;justify-content:space-between}
+.agents .name{color:var(--fg);font-weight:bold}
+.agents .max .name{color:var(--accent)}
+.agents .chronos .name{color:#fff}
+.agents .athena .name{color:var(--violet)}
+.agents .ok{color:var(--ok)} .agents .bad{color:var(--bad)} .agents .dim,.agents .meta,.agents .role{color:var(--dim)}
+.agents .ctx{display:flex;align-items:center;gap:.6rem;margin:.3rem 0;white-space:pre}
+.agents .track{flex:1;position:relative;height:3px;background:#1d1d1d}
+.agents .fill{position:absolute;left:0;top:0;height:3px;background:var(--accent)}
+.agents .fill.warn{background:var(--warn)} .agents .fill.bad{background:var(--bad)}
+.agents .empty{color:var(--dim)}

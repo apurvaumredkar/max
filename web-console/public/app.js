@@ -155,14 +155,6 @@ async function tunnels() {
 tunnels();
 setInterval(tunnels, 30000);
 
-// Logo ring: each box needs its top offset within .side to place its slice of the circle (see style.css).
-const side = document.querySelector('.side');
-const placeRings = () => side.querySelectorAll('.box').forEach(b => b.style.setProperty('--y', b.offsetTop + 'px'));
-// watch every box: the column has a fixed height, so a box growing (e.g. a Storage tab switch) only moves the ones below
-const ringWatch = new ResizeObserver(placeRings);
-side.querySelectorAll('.box').forEach(b => ringWatch.observe(b));
-placeRings();
-
 // Chat pane: full history of the root agent (agents.db `root` table); Enter sends, Shift+Enter is a newline.
 const log = document.getElementById('log'), chatIn = document.getElementById('chat-in');
 const chatBtn = document.querySelector('#chat-form button');
@@ -184,9 +176,50 @@ function toolBlock(command, output) {
   return b;
 }
 
-// One step of a turn, as stored: thinking (grey italics), text said before a tool call, or a tool call.
+// Sub-agents (reached through the blackboard): their work shows indented, as "<name>> what they said", in their own
+// colour (Chronos white, Athena violet), instead of a "$ command" tool block.
+const SUBAGENTS = ['athena', 'chronos'];
+function subBlock(agent, request, text) {
+  const b = document.createElement('div');
+  b.className = 'sub ' + agent;
+  if (request) {
+    const q = document.createElement('div');
+    q.className = 'req';
+    q.textContent = 'max -> ' + agent + ': ' + request;
+    b.appendChild(q);
+  }
+  const line = document.createElement('div');
+  line.innerHTML = '<span class="who">' + agent + '&gt; </span>';
+  const t = document.createElement('span');
+  line.appendChild(t);
+  b.appendChild(line);
+  b.setOutput = out => { t.textContent = subText(agent, out); };
+  if (text !== undefined) b.setOutput(text);
+  return b;
+}
+// What a sub-agent said, from its tool output (which also carries notes meant for the model).
+function subText(agent, out) {
+  out = String(out || '').trim()
+    .replace(/^[a-z]+ answered:\s*/i, '')
+    .replace(/\s*\(What they fetched is now on the user's screen[^)]*\)/, '')
+    .replace(/\s*Her answer describes emails:[\s\S]*$/, '');
+  if (agent === 'chronos') return out.replace(/^Chronos answered:\s*/, '').replace(/\s*The schedule is now on the user's screen.*$/, '');
+  if (agent === 'athena') return out.split('\n')[0].replace(/^Athena /, '').replace(/; the list is now on the user's screen.*$/, ' (in the Agent Workspace)');
+  return out;
+}
+
+// One step of a turn, as stored: thinking (grey italics), text said before a tool call, a tool call, a sub-agent's
+// work, or a sub-agent report handed to Max at the start of the turn.
+// "agent: request", the label of a delegate call
+const delegated = command => { const m = String(command || '').match(/^([a-z]+):\s*([\s\S]*)$/); return m ? [m[1], m[2]] : ['agent', command]; };
 function stepNode(st) {
+  if (st.type === 'tool' && st.name === 'delegate') { const [a, req] = delegated(st.command); return subBlock(a, req, st.output); }
+  if (st.type === 'tool' && SUBAGENTS.includes(st.name)) return subBlock(st.name, st.command, st.output);
   if (st.type === 'tool') return toolBlock(st.command, st.output);
+  if (st.type === 'report') {
+    const agent = st.agent || 'agent';
+    return subBlock(agent, '', String(st.text || '').replace(new RegExp('^' + agent + ':\\s*'), ''));
+  }
   const d = document.createElement('div');
   d.className = st.type === 'thinking' ? 'think' : 'steptext';
   d.textContent = (st.text || '').trim();
@@ -219,6 +252,7 @@ function addMsg(role, text, cls = '', extra = {}) {
 const grow = () => { chatIn.style.height = 'auto'; chatIn.style.height = chatIn.scrollHeight + 'px'; };
 chatIn.addEventListener('input', grow);
 chatIn.addEventListener('keydown', e => {
+  if (picker.open) return;  // the picker has the keyboard (its own handler below)
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); document.getElementById('chat-form').requestSubmit(); }
 });
 
@@ -226,6 +260,11 @@ document.getElementById('chat-form').addEventListener('submit', async e => {
   e.preventDefault();
   const text = chatIn.value.trim();
   if (!text || chatBtn.disabled) return;
+  if (/^\/model\s*$/i.test(text)) {  // the model picker lives here too (see pickerOpen)
+    chatIn.value = ''; grow();
+    pickerOpen();
+    return;
+  }
   const vm = text.match(/^\/voice(?:\s+(on|off))?\s*$/i);
   if (vm) {  // voice mode lives here (it needs the mic); the agent does STT -> turn -> TTS over /api/voice
     chatIn.value = ''; grow();
@@ -274,8 +313,10 @@ async function readEvents(r, onEvent) {
 }
 
 // Context meter above the input: tokens the conversation fills in the model's window, as of the last reply.
+let lastCtx = null;  // the meter's last reading, so a model switch can redraw it with the new maximum
 function showContext(c) {
   if (!c) return;
+  lastCtx = c;
   const k = n => (n / 1000).toFixed(1) + 'k';
   const p = c.used == null ? 0 : Math.min(100, 100 * c.used / c.max);
   const label = c.used == null ? 'context <span class="dim">known after the next reply</span>'
@@ -284,15 +325,49 @@ function showContext(c) {
     '<span class="track"><span class="fill" style="width:' + p.toFixed(1) + '%"></span></span>';
 }
 
-async function loadHistory() {
+// `restore`: bring back the newest workspace view too (first load only: a reload after /clear leaves the Agent
+// Workspace as it is, since clearing the chat isn't a request to change what's on screen)
+async function loadHistory(restore = false) {
   try {
     const d = await (await fetch('/api/chat', { cache: 'no-store' })).json();
     log.textContent = '';
     showContext(d.context);
     d.messages.forEach(m => addMsg(m.role, m.content, '', m));
+    // bring back the newest workspace view (e.g. the last email list) without switching tabs
+    const views = restore ? d.messages.flatMap(m => (m.steps || []).map(s => s.view).filter(Boolean)) : [];
+    if (views.length) renderView(views[views.length - 1], false);
   } catch (e) {}
 }
-loadHistory();
+loadHistory(true);
+
+// Live pushes from the root agent (push.rs), one stream per tab: Max telling the user something on his own (e.g.
+// about new mail from Athena) and sub-agent reports (Chronos' reminders). The tab also says whether it has focus:
+// Max sends his own messages to Discord only when no console tab is open and focused.
+const TAB = Math.random().toString(36).slice(2);
+const focusedNow = () => document.hasFocus() && document.visibilityState === 'visible';
+function sendPresence() {
+  fetch('/api/presence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+    body: JSON.stringify({ id: TAB, focused: focusedNow() }) }).catch(() => {});
+}
+function pushEvent(ev) {
+  if (ev.type === 'proactive') follow(() => {
+    addMsg('assistant', ev.text || '', '', ev);
+    showContext(ev.context);
+    (ev.steps || []).forEach(st => st.view && renderView(st.view, false));
+  });
+  else if (ev.type === 'report') follow(() => {
+    const d = document.createElement('div');
+    d.className = 'msg assistant';
+    d.appendChild(subBlock(ev.agent || 'agent', '', ev.text || ''));
+    log.appendChild(d);
+  });
+}
+const push = new EventSource('/api/events?id=' + TAB + '&focused=' + (focusedNow() ? 1 : 0));
+push.onmessage = e => { try { pushEvent(JSON.parse(e.data)); } catch (err) {} };
+push.onopen = sendPresence;  // after a reconnect too, so the agent has this tab's current focus
+window.addEventListener('focus', sendPresence);
+window.addEventListener('blur', sendPresence);
+document.addEventListener('visibilitychange', sendPresence);
 
 // Logs box: live agent logs (agents/logs/agents.jsonl via /api/logs SSE). Keeps the last 500 lines and follows the
 // bottom unless you've scrolled up.
@@ -375,7 +450,7 @@ async function voiceStart() {
   };
   ws.onmessage = e => typeof e.data === 'string' ? voiceEvent(JSON.parse(e.data)) : playPcm(e.data);
   ws.onclose = () => { if (voice.ws === ws && voice.on) voiceStop('voice mode ended: connection closed'); };
-  chatBox.dataset.title = 'Max · voice';
+  showPane(pane);  // the Chat tab shows "· voice"
   addMsg('assistant', 'voice mode: connecting ...', 'dim');
 }
 
@@ -386,7 +461,7 @@ function voiceStop(note) {
   if (voice.ctx) voice.ctx.close();
   voice.mic = voice.ctx = null; voice.playEnd = voice.quietUntil = 0; voice.sources = [];
   if (turnLive) { turnLive.el.remove(); turnLive = null; }
-  chatBox.dataset.title = 'Max';
+  showPane(pane);
   if (note) addMsg('assistant', note, 'dim');
 }
 
@@ -455,12 +530,14 @@ function turnEvent(ev) {
   });
   else if (ev.type === 'tool_call' && live) follow(() => {
     flushBody();
-    live.lastTool = toolBlock(ev.command);
+    live.lastTool = ev.name === 'delegate' ? subBlock(...delegated(ev.command))
+      : SUBAGENTS.includes(ev.name) ? subBlock(ev.name, ev.command) : toolBlock(ev.command);
     live.lastTool.setOutput('running ...');
     live.steps.appendChild(live.lastTool);
     live.cur = live.lastTool; live.curType = 'tool';
   });
   else if (ev.type === 'tool_result' && live && live.lastTool) follow(() => live.lastTool.setOutput(ev.output));
+  else if (ev.type === 'view') renderView(ev.view, true);  // Athena's email list, Chronos' schedule -> Agent Workspace
   else if (ev.type === 'reply') {
     if (live) { live.el.remove(); turnLive = null; }
     const el = addMsg('assistant', ev.text, '', ev);
@@ -505,3 +582,428 @@ function playPcm(buf) {
   voice.sources.push(src);
   src.onended = () => { voice.sources = voice.sources.filter(s => s !== src); };
 }
+
+// Chat pane title: one pane today (the graph lives in the workspace on the left); kept as tabs for more panes later.
+const PANES = [['chat', 'Chat']];
+let pane = 'chat';
+try { pane = localStorage.getItem('chatPane') || 'chat'; } catch (e) {}
+
+function showPane(k) {
+  pane = PANES.some(([p]) => p === k) ? k : 'chat';
+  try { localStorage.setItem('chatPane', pane); } catch (e) {}
+  document.getElementById('panetabs').innerHTML = '[ ' + PANES.map(([p, label]) =>
+    '<span class="tab' + (p === pane ? ' on' : '') + '" data-pane="' + p + '">' + label +
+    (p === 'chat' && voice.on ? ' · voice' : '') + '</span>').join('<span class="dim"> · </span>') + ' ]';
+  PANES.forEach(([p]) => { document.getElementById('pane-' + p).hidden = p !== pane; });
+}
+document.getElementById('panetabs').addEventListener('click', e => {
+  const t = e.target.closest('[data-pane]');
+  showPane(t ? t.dataset.pane : PANES[(PANES.findIndex(([p]) => p === pane) + 1) % PANES.length][0]);
+});
+
+// /model: pick the model Max runs on, in the chat pane. Every model on every inference box (Ollama) plus OpenRouter's
+// tool-capable ones (GET /api/models). ↑/↓ move, typing filters, Enter picks (or click); then ←/→ or drag sets the
+// context length (powers of two up to the model's maximum) and Enter applies it (POST /api/model). Esc goes back.
+const picker = { open: false, stage: 'list', items: [], filter: '', idx: 0, cur: null, chosen: null, steps: [], si: 0,
+                 note: '', errors: [] };
+const pickerEl = document.getElementById('picker');
+const isCurrent = m => picker.cur && m.provider === picker.cur.provider && m.base === picker.cur.base && m.name === picker.cur.model;
+const pickerVisible = () => {
+  const f = picker.filter.toLowerCase();
+  return picker.items.filter(m => !f || (m.host + ' ' + m.name).toLowerCase().includes(f));
+};
+
+async function pickerOpen() {
+  Object.assign(picker, { open: true, stage: 'list', filter: '', idx: 0, items: [], errors: [], note: 'loading models ...' });
+  log.hidden = true; pickerEl.hidden = false; chatIn.blur();
+  renderPicker();
+  try {
+    const d = await (await fetch('/api/models', { cache: 'no-store' })).json();
+    picker.cur = d.current && !d.current.error ? d.current : null;
+    picker.items = d.groups.flatMap(g => g.models.map(m => ({ ...m, provider: g.provider, host: g.label, base: g.base })));
+    picker.errors = d.groups.filter(g => g.error).map(g => g.label + ': ' + g.error);
+    picker.note = picker.cur ? 'now: ' + picker.cur.model + ' on ' + picker.cur.host + ', context ' +
+      picker.cur.num_ctx.toLocaleString() : '';
+    picker.idx = Math.max(0, pickerVisible().findIndex(isCurrent));
+  } catch (e) { picker.note = 'error: ' + e.message; }
+  renderPicker();
+}
+
+function pickerClose(note) {
+  picker.open = false; pickerEl.hidden = true; log.hidden = false;
+  if (note) addMsg('assistant', note, 'dim');
+  log.scrollTop = log.scrollHeight;
+  chatIn.focus();
+}
+
+async function pickerChoose(m) {
+  if (!m) return;
+  Object.assign(picker, { chosen: m, stage: 'ctx', steps: [], note: "reading the model's context size ..." });
+  renderPicker();
+  let max = m.ctx || 0, caps = null;
+  if (m.provider === 'ollama') {
+    try {
+      const d = await (await fetch('/api/models/info?base=' + encodeURIComponent(m.base) + '&model=' + encodeURIComponent(m.name))).json();
+      if (d.error) throw new Error(d.error);
+      max = d.ctx; caps = d.capabilities;
+    } catch (e) { picker.note = "couldn't read its context size (" + e.message + '); assuming 32k'; }
+  }
+  if (!max) max = 32768;
+  const steps = [];
+  for (let v = 2048; v < max; v *= 2) steps.push(v);
+  steps.push(max);
+  const want = isCurrent(m) ? picker.cur.num_ctx : Math.min(max, 32768);
+  picker.steps = steps;
+  picker.si = steps.reduce((b, v, i) => Math.abs(v - want) < Math.abs(steps[b] - want) ? i : b, 0);
+  if (caps) picker.note = caps.includes('tools') ? '' : "note: this model can't call tools, so Max can't use bash or Athena with it";
+  else if (!picker.note.startsWith("couldn't")) picker.note = '';
+  renderPicker();
+}
+
+async function pickerApply() {
+  const m = picker.chosen, num_ctx = picker.steps[picker.si];
+  picker.note = 'switching ...'; renderPicker();
+  try {
+    const d = await (await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: m.provider, host: m.host, base: m.base, model: m.name, num_ctx }) })).json();
+    if (d.error) throw new Error(d.error);
+    showContext({ used: lastCtx ? lastCtx.used : null, max: num_ctx });
+    pickerClose(d.note);
+  } catch (e) { picker.note = 'error: ' + e.message; renderPicker(); }
+}
+
+function renderPicker() {
+  const hint = t => '<span class="dim">' + t + '</span>';
+  if (picker.stage === 'list') {
+    const vis = pickerVisible();
+    picker.idx = Math.min(picker.idx, Math.max(0, vis.length - 1));
+    let html = '<div class="phead">[ model ] ' + hint('↑↓ move · type to filter · Enter pick · Esc close') + '</div>' +
+      '<div class="pfilter">filter&gt; ' + esc(picker.filter) + '<span class="caret">_</span></div>' +
+      (picker.note ? '<div class="dim">' + esc(picker.note) + '</div>' : '');
+    let group = null;
+    vis.forEach((m, i) => {
+      if (m.host !== group) {
+        group = m.host;
+        html += '<div class="pgroup">' + esc(m.host) + ' ' + hint(m.provider === 'openrouter' ? 'openrouter.ai' : 'ollama') + '</div>';
+      }
+      const det = m.provider === 'openrouter'
+        ? [m.ctx ? Math.round(m.ctx / 1024) + 'k ctx' : '', m.price != null ? '$' + m.price + '/M in' : '',
+           m.price_out != null ? '$' + m.price_out + '/M out' : ''].filter(Boolean).join('  ')
+        : [m.params, m.quant, m.size ? (m.size / 1e9).toFixed(1) + ' GB' : ''].filter(Boolean).join('  ');
+      html += '<div class="prow' + (i === picker.idx ? ' on' : '') + '" data-i="' + i + '"><span class="pm">' +
+        (i === picker.idx ? '>' : ' ') + (isCurrent(m) ? '●' : ' ') + '</span><span class="pn">' + esc(m.name) +
+        '</span>' + hint(esc(det)) + '</div>';
+    });
+    if (!vis.length && picker.items.length) html += '<div class="dim">no models match</div>';
+    picker.errors.forEach(e => { html += '<div class="err">' + esc(e) + '</div>'; });
+    pickerEl.innerHTML = html;
+    const on = pickerEl.querySelector('.prow.on');
+    if (on) on.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  const m = picker.chosen, steps = picker.steps;
+  let html = '<div class="phead">[ context ] ' + hint('←→ or drag · Enter apply · Esc back') + '</div>' +
+    '<div class="pgroup">' + esc(m.name) + ' ' + hint('on ' + esc(m.host)) + '</div>';
+  if (steps.length) {
+    html += '<div class="pslider"><input type="range" id="pk-range" min="0" max="' + (steps.length - 1) + '" step="1" value="' +
+      picker.si + '"></div><div><span id="pk-val">' + steps[picker.si].toLocaleString() + '</span> tokens ' +
+      hint('of ' + steps[steps.length - 1].toLocaleString() + ' max') + '</div>';
+    if (m.provider === 'openrouter') html += '<div class="dim">OpenRouter runs the model at its own context size; this sets the context meter.</div>';
+  }
+  if (picker.note) html += '<div class="dim">' + esc(picker.note) + '</div>';
+  pickerEl.innerHTML = html;
+  const r = document.getElementById('pk-range');
+  if (r) r.addEventListener('input', () => {  // drag: update the number only, so the slider isn't redrawn mid-drag
+    picker.si = +r.value;
+    document.getElementById('pk-val').textContent = steps[picker.si].toLocaleString();
+  });
+}
+
+document.addEventListener('keydown', e => {
+  if (!picker.open) return;
+  if (picker.stage === 'list') {
+    const n = pickerVisible().length;
+    if (e.key === 'ArrowDown') picker.idx = n ? (picker.idx + 1) % n : 0;
+    else if (e.key === 'ArrowUp') picker.idx = n ? (picker.idx - 1 + n) % n : 0;
+    else if (e.key === 'Enter') { e.preventDefault(); pickerChoose(pickerVisible()[picker.idx]); return; }
+    else if (e.key === 'Escape') { e.preventDefault(); pickerClose(); return; }
+    else if (e.key === 'Backspace') { picker.filter = picker.filter.slice(0, -1); picker.idx = 0; }
+    else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) { picker.filter += e.key; picker.idx = 0; }
+    else return;
+  } else {
+    if (e.key === 'ArrowLeft') picker.si = Math.max(0, picker.si - 1);
+    else if (e.key === 'ArrowRight') picker.si = Math.min(picker.steps.length - 1, picker.si + 1);
+    else if (e.key === 'Enter') { e.preventDefault(); if (picker.steps.length) pickerApply(); return; }
+    else if (e.key === 'Escape') { picker.stage = 'list'; picker.note = ''; }
+    else return;
+  }
+  e.preventDefault();
+  renderPicker();
+});
+pickerEl.addEventListener('click', e => {
+  const row = e.target.closest('.prow');
+  if (row) { picker.idx = +row.dataset.i; pickerChoose(pickerVisible()[picker.idx]); }
+});
+
+// Knowledge graph of context/ (GET /api/graph: {nodes:[{id,label,type,attrs,sources}], edges:[{from,to,rel}]}),
+// laid out once with a small force simulation and drawn as SVG. Hover a node for its links; click to pin it.
+let G = null, gPinned = null;
+const TYPE_COLOR = { doc: 'fg', section: 'dim', service: 'accent', term: 'violet' };  // node types agents/kg emits
+const CHAR_W = 6.7;  // px per character of an 11px monospace label
+
+async function drawGraph() {
+  const svg = document.getElementById('graph');
+  if (!G) {
+    try { G = await (await fetch('/api/graph', { cache: 'no-store' })).json(); }
+    catch (e) { G = { error: e.message, nodes: [], edges: [] }; }
+    G.byId = Object.fromEntries(G.nodes.map(n => [n.id, n]));
+    G.nbrs = Object.fromEntries(G.nodes.map(n => [n.id, new Set([n.id])]));
+    G.edges.forEach(e => { G.nbrs[e.from].add(e.to); G.nbrs[e.to].add(e.from); });
+  }
+  const W = svg.clientWidth, H = svg.clientHeight;
+  if (!W || !H || G.drawn === W + 'x' + H) return;
+  G.drawn = W + 'x' + H;
+  layoutGraph(G.nodes, G.edges, W, H);
+  const deg = id => G.nbrs[id].size - 1;
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.innerHTML = '<g class="edges">' +
+    G.edges.map((e, i) => {
+      const a = G.byId[e.from], b = G.byId[e.to];
+      return '<line data-i="' + i + '" class="' + (e.rel === 'mentions' ? 'mentions' : '') + '" x1="' + a.x.toFixed(1) +
+        '" y1="' + a.y.toFixed(1) + '" x2="' + b.x.toFixed(1) + '" y2="' + b.y.toFixed(1) + '"/>';
+    }).join('') + '</g><g class="rels"></g>' +
+    G.nodes.map(n => {
+      const shape = n.type === 'doc' ? '<rect x="-4.5" y="-4.5" width="9" height="9" class="t-doc"/>'
+        : '<circle r="' + (3.5 + Math.min(deg(n.id), 10) * 0.35).toFixed(1) + '" class="t-' + esc(n.type) + '"/>';
+      return '<g class="node" data-id="' + esc(n.id) + '" transform="translate(' + n.x.toFixed(1) + ',' + n.y.toFixed(1) + ')">' +
+        shape + '<text x="9" y="4">' + esc(n.label) + '</text></g>';
+    }).join('');
+  graphFocus(gPinned);
+}
+
+// 1) Fruchterman-Reingold with no walls (walls pile nodes up along the edges); "mentions" pull at quarter strength
+//    so the document hubs don't drag everything into one clump. 2) Scale the result to fill the box. 3) Push apart
+//    any labels that overlap, using each label's real width, and keep every label inside the box.
+function layoutGraph(nodes, edges, W, H) {
+  const n = nodes.length, idx = {}, k = Math.sqrt(W * H / Math.max(n, 1));
+  nodes.forEach((v, i) => { idx[v.id] = i; v.x = Math.cos(2 * Math.PI * i / n) * W / 3; v.y = Math.sin(2 * Math.PI * i / n) * H / 3; });
+  const springs = {};
+  edges.forEach(e => {
+    const key = [idx[e.from], idx[e.to]].sort((a, b) => a - b).join(',');
+    springs[key] = Math.max(springs[key] || 0, e.rel === 'mentions' ? 0.25 : 1);
+  });
+  const pairs = Object.entries(springs).map(([key, w]) => [...key.split(',').map(Number), w]);
+  let t = k;
+  for (let it = 0; it < 600; it++) {
+    const dx = new Float64Array(n), dy = new Float64Array(n);
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+      const x = nodes[i].x - nodes[j].x, y = nodes[i].y - nodes[j].y, d2 = Math.max(x * x + y * y, 0.01), f = k * k / d2;
+      dx[i] += x * f; dy[i] += y * f; dx[j] -= x * f; dy[j] -= y * f;
+    }
+    pairs.forEach(([i, j, w]) => {
+      const x = nodes[i].x - nodes[j].x, y = nodes[i].y - nodes[j].y, f = w * Math.hypot(x, y) / k;
+      dx[i] -= x * f; dy[i] -= y * f; dx[j] += x * f; dy[j] += y * f;
+    });
+    nodes.forEach((v, i) => {
+      dx[i] -= v.x * 0.02; dy[i] -= v.y * 0.02;  // gentle pull to the centre
+      const d = Math.max(Math.hypot(dx[i], dy[i]), 0.01), step = Math.min(d, t);
+      v.x += dx[i] / d * step; v.y += dy[i] / d * step;
+    });
+    t = Math.max(t * 0.99, 0.5);
+  }
+  // fit: nodes into the box, leaving room on the right for an average label
+  const pad = 16, lw = v => 9 + v.label.length * CHAR_W, rightRoom = 120;
+  const xs = nodes.map(v => v.x), ys = nodes.map(v => v.y);
+  const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  nodes.forEach(v => {
+    v.x = pad + (v.x - x0) / Math.max(x1 - x0, 1) * (W - 2 * pad - rightRoom);
+    v.y = pad + (v.y - y0) / Math.max(y1 - y0, 1) * (H - 2 * pad);
+  });
+  // de-overlap: sweep top to bottom; a label that hits one already placed drops just below it
+  const box = v => [v.x - 6, v.x + lw(v), v.y - 9, v.y + 9];
+  const hits = (A, B) => Math.min(A[1], B[1]) > Math.max(A[0], B[0]) && Math.min(A[3], B[3]) > Math.max(A[2], B[2]);
+  const placed = [];
+  nodes.forEach(v => { v.x = Math.min(W - pad - lw(v), Math.max(pad, v.x)); });
+  [...nodes].sort((a, b) => a.y - b.y).forEach(v => {
+    for (let hit; (hit = placed.find(p => hits(box(p), box(v)))); ) v.y = hit.y + 19;
+    placed.push(v);
+  });
+  // if the sweep pushed the bottom past the box, squeeze everything back in (spacing permitting)
+  const yMax = Math.max(...nodes.map(v => v.y));
+  if (yMax > H - pad) nodes.forEach(v => { v.y = pad + (v.y - pad) * (H - 2 * pad) / (yMax - pad); });
+}
+
+// Highlight a node, its neighbours and its edges (with their relation names); null: everything normal.
+function graphFocus(id) {
+  const svg = document.getElementById('graph');
+  svg.querySelectorAll('.node').forEach(g => {
+    g.classList.toggle('faded', !!id && !G.nbrs[id].has(g.dataset.id));
+    g.classList.toggle('on', g.dataset.id === id);
+  });
+  const rels = [];
+  svg.querySelectorAll('line').forEach(l => {
+    const e = G.edges[l.dataset.i], hot = !!id && (e.from === id || e.to === id);
+    l.classList.toggle('hot', hot);
+    l.classList.toggle('faded-line', !!id && !hot);
+    if (hot && e.rel !== 'mentions') {
+      const a = G.byId[e.from], b = G.byId[e.to];
+      rels.push('<text class="rel" text-anchor="middle" x="' + ((a.x + b.x) / 2).toFixed(1) + '" y="' + ((a.y + b.y) / 2 - 3).toFixed(1) + '">' + esc(e.rel) + '</text>');
+    }
+  });
+  const relLayer = svg.querySelector('.rels');
+  if (relLayer) relLayer.innerHTML = rels.join('');
+
+  const info = document.getElementById('ginfo');
+  if (G.error) { info.innerHTML = '<span class="bad">' + esc(G.error) + '</span>'; return; }
+  if (!id) {
+    const types = [...new Set(G.nodes.map(n => n.type))];
+    info.innerHTML = G.nodes.length + ' nodes, ' + G.edges.length + ' edges <span class="dim">from context/: hover a node, click to pin</span>\n' +
+      types.map(t => '<span class="sw" style="color:var(--' + (TYPE_COLOR[t] || 'fg') + ')">' + (t === 'doc' ? '■' : '●') + '</span> ' + esc(t)).join('   ') +
+      '   <span class="dim">- - mentions</span>';
+    return;
+  }
+  const n = G.byId[id], lbl = x => esc(G.byId[x].label);
+  const attrs = Object.entries(n.attrs || {}).map(([k, v]) => '  <span class="k">' + esc(k) + '</span> ' + esc(v)).join('\n');
+  const out = G.edges.filter(e => e.from === id && e.rel !== 'mentions').map(e => '  → ' + esc(e.rel) + ' ' + lbl(e.to));
+  const inn = G.edges.filter(e => e.to === id && e.rel !== 'mentions').map(e => '  ← ' + esc(e.rel) + ' ' + lbl(e.from));
+  const mentions = G.edges.filter(e => e.from === id && e.rel === 'mentions').map(e => lbl(e.to));
+  info.innerHTML = '<span class="sw" style="color:var(--' + (TYPE_COLOR[n.type] || 'fg') + ')">' + (n.type === 'doc' ? '■' : '●') + '</span> ' +
+    '<span class="k">' + esc(n.label) + '</span> <span class="dim">[' + esc(n.type) + ']</span>\n' +
+    (attrs ? attrs + '\n' : '') + out.concat(inn).join('\n') + (out.length + inn.length ? '\n' : '') +
+    (n.sources.length ? '<span class="dim">in: ' + esc(n.sources.join(', ')) + '</span>' : '') +
+    (mentions.length ? '<span class="dim">mentions: ' + mentions.join(', ') + '</span>' : '');
+}
+
+const graphSvg = document.getElementById('graph');
+graphSvg.addEventListener('mouseover', e => { const g = e.target.closest('.node'); if (g) graphFocus(g.dataset.id); });
+graphSvg.addEventListener('mouseout', e => { if (e.target.closest('.node')) graphFocus(gPinned); });
+graphSvg.addEventListener('click', e => {
+  const g = e.target.closest('.node');
+  gPinned = g && g.dataset.id !== gPinned ? g.dataset.id : null;
+  graphFocus(gPinned);
+});
+// Left column tabs: Monitor (the status boxes), Graph, Agents (each agent's status and context use) and Workspace
+// (whatever Max's agents last fetched: Athena's email list, Chronos' schedule). Click a tab, or the row to cycle.
+const SIDE_TABS = [['monitor', 'Monitor'], ['graph', 'Graph'], ['agents', 'Agents'], ['agent', 'Workspace']];
+let sideTab = 'graph';
+try { sideTab = localStorage.getItem('sideTab') || 'graph'; } catch (e) {}
+if (sideTab === 'mail') sideTab = 'agent';  // the old Mail tab
+
+function showSide(k) {
+  sideTab = SIDE_TABS.some(([t]) => t === k) ? k : 'graph';
+  try { localStorage.setItem('sideTab', sideTab); } catch (e) {}
+  document.getElementById('sidetabs').innerHTML = '[ ' + SIDE_TABS.map(([t, label]) =>
+    '<span class="tab' + (t === sideTab ? ' on' : '') + '" data-side="' + t + '">' + label + '</span>')
+    .join('<span class="dim"> · </span>') + ' ]';
+  document.querySelector('.side').classList.toggle('monitor', sideTab === 'monitor');
+  document.querySelectorAll('.wview').forEach(v => { v.hidden = v.id !== 'view-' + sideTab; });
+  if (sideTab === 'graph') drawGraph();  // drawn at its on-screen size, so only once visible
+  if (sideTab === 'agents') agentsTick();
+}
+
+// A view from Max's turn (a `view` event, or a stored tool step on reload): render it into the Agent Workspace.
+// `show` switches to that tab (live turns); a restored view just updates it.
+function renderView(v, show) {
+  if (!v) return;
+  const html = v.kind === 'email.list' ? mailView(v) : v.kind === 'schedule' ? scheduleView(v) : null;
+  if (html === null) return;
+  document.getElementById('view-agent').innerHTML = html;
+  if (show) showSide('agent');
+}
+
+// Chronos' schedule: jobs (reminders), then calendar events from today on.
+function scheduleView(v) {
+  const jobs = v.jobs || [], events = v.events || [];
+  const cal = v.calendar === 'ok' ? '' : ' · <span class="bad">calendar ' + esc(v.calendar || 'not connected') + '</span>';
+  const jobRows = jobs.map(j =>
+    '<div class="row' + (j.enabled ? '' : ' off') + '"><span class="n">' + esc(j.id.replace('job-', '')) + '</span><div>' +
+    '<div class="top"><span class="from">' + esc(j.name) + '</span><span class="when">' +
+    (j.enabled ? (j.next ? 'next ' + esc(j.next) : '') : (j.last_run ? 'done ' + esc(j.last_run) : 'paused')) + '</span></div>' +
+    '<div class="subj">' + (j.prompt ? '<span class="dim">written fresh each time:</span> ' + esc(j.prompt) +
+      (j.last_message ? '<div class="prev">last: ' + esc(j.last_message) + '</div>' : '') : esc(j.message || '')) +
+    '</div><div class="prev">' + esc(j.when) +
+    (j.runs ? ' · ran ' + j.runs + 'x' : '') + '</div></div></div>').join('');
+  let day = '';
+  const evRows = events.map(e => {
+    const d = String(e.start || '').split(',')[0].replace(' (all day)', '');
+    const head = d !== day ? '<div class="day">' + esc(d) + '</div>' : '';
+    day = d;
+    const time = e.all_day ? 'all day' : String(e.start || '').split(', ')[1] || '';
+    const end = !e.all_day && e.end ? ' - ' + (String(e.end).split(', ')[1] || '') : '';
+    return head + '<div class="row' + (e.past ? ' off' : '') + '"><span class="n">' + (e.recurring ? '&#8635;' : '') + '</span><div>' +
+      '<div class="top"><span class="subj">' + esc(e.title) + '</span><span class="when">' + esc(time + end) + '</span></div>' +
+      '<div class="prev">' + esc(e.calendar || '') + (e.location ? ' · ' + esc(e.location) : '') + '</div></div></div>';
+  }).join('');
+  return '<div class="head"><span class="k">Schedule</span> · ' + jobs.filter(j => j.enabled).length + ' active jobs · ' +
+    events.length + ' events in ' + (v.days || 14) + ' days · by ' + esc(v.by || 'chronos') + (v.at ? ' at ' + esc(v.at) : '') + cal + '</div>' +
+    (v.jobs_error ? '<div class="empty bad">' + esc(v.jobs_error) + '</div>' : '') +
+    '<div class="sect">Jobs</div>' + (jobRows || '<div class="empty">No jobs.</div>') +
+    '<div class="sect">Calendar</div>' + (evRows || '<div class="empty">No events.</div>');
+}
+
+// Athena's email list.
+function mailView(v) {
+  const acct = v.account === 'gmail' ? 'Gmail' : v.account === 'both' ? 'Gmail + Outlook' : 'Outlook', emails = v.emails || [];
+  const rows = emails.map((m, i) =>
+    '<div class="row' + (m.unread ? ' unread' : '') + '"><span class="n">' + (i + 1) + '</span><div>' +
+    '<div class="top"><span class="from">' + esc(m.from || '?') + '</span><span class="when">' +
+    (m.attachment ? '[attachment] ' : '') + esc(m.when || '') + '</span></div>' +
+    '<div class="subj">' + esc(m.subject || '(no subject)') + '</div>' +
+    (m.preview ? '<div class="prev">' + esc(m.preview) + '</div>' : '') + '</div></div>').join('');
+  return '<div class="head"><span class="k">' + acct + '</span> · ' + emails.length + ' newest' +
+    (v.unread_only ? ' unread' : '') + ' · fetched by ' + esc(v.by || 'athena') + (v.at ? ' at ' + esc(v.at) : '') +
+    ' · <span title="unread in bold, numbered in blue">' + emails.filter(m => m.unread).length + ' unread</span></div>' +
+    (rows || '<div class="empty">No emails.</div>');
+}
+// Agents tab: every agent (Max, then the sub-agents on the board) with its model, whether it's running, and how much
+// of its context window is in use: Max's whole conversation; a sub-agent's latest model call (each of its requests
+// starts a fresh window). Refreshed every 3 s while the tab is shown.
+function ago(sqlTime) {  // "YYYY-MM-DD HH:MM:SS" in UTC (SQLite CURRENT_TIMESTAMP) -> "3 min ago"
+  if (!sqlTime) return '';
+  const t = Date.parse(sqlTime.replace(' ', 'T') + (sqlTime.endsWith('Z') ? '' : 'Z'));
+  if (isNaN(t)) return '';
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  return s < 60 ? 'just now' : s < 3600 ? Math.round(s / 60) + ' min ago' : s < 86400 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' d ago';
+}
+function agentsView(list) {
+  const k = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  return list.map(a => {
+    const used = a.ctx_used, max = a.ctx_max || 0, p = used != null && max ? Math.min(100, 100 * used / max) : 0;
+    const level = p > 85 ? 'bad' : p > 60 ? 'warn' : '';
+    const ctx = used == null ? '<span class="dim">no model call yet</span>'
+      : Math.round(p) + '% <span class="dim">' + k(used) + ' / ' + k(max) + ' tokens</span>';
+    return '<div class="agent ' + esc(a.name) + '">' +
+      '<div class="top"><span class="name">' + esc(a.name) + '</span><span class="' + (a.online ? 'ok' : 'bad') + '">' +
+      (a.online ? '● online' : '○ offline') + '</span></div>' +
+      '<div class="role">' + esc(a.role || '') + '</div>' +
+      '<div class="ctx">context ' + ctx + '<span class="track"><span class="fill ' + level + '" style="width:' + p.toFixed(1) + '%"></span></span></div>' +
+      '<div class="meta">' + esc(a.model || '') + ' · window: ' + esc(a.window || '') + (a.ctx_at ? ' · last used ' + ago(a.ctx_at) : '') + '</div>' +
+      '</div>';
+  }).join('');
+}
+async function agentsTick() {
+  if (sideTab !== 'agents') return;
+  try {
+    const d = await (await fetch('/api/agents', { cache: 'no-store' })).json();
+    document.getElementById('view-agents').innerHTML = d.agents ? agentsView(d.agents) : '<div class="empty bad">' + esc(d.error || 'no data') + '</div>';
+  } catch (e) {}
+}
+setInterval(agentsTick, 3000);
+
+// The left column's tab after (step 1) or before (step -1) the current one, wrapping around.
+const sideStep = step => SIDE_TABS[(SIDE_TABS.findIndex(([s]) => s === sideTab) + step + SIDE_TABS.length) % SIDE_TABS.length][0];
+document.getElementById('sidetabs').addEventListener('click', e => {
+  const t = e.target.closest('[data-side]');
+  showSide(t ? t.dataset.side : sideStep(1));
+});
+// Tab cycles the left column's tabs (Shift+Tab goes back), wherever the focus is; the chat input keeps its focus.
+// Not while the /model picker is open (it has the keyboard).
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey || e.isComposing || picker.open) return;
+  e.preventDefault();
+  showSide(sideStep(e.shiftKey ? -1 : 1));
+});
+
+window.addEventListener('resize', () => { if (sideTab === 'graph') drawGraph(); });
+showPane(pane);
+showSide(sideTab);  // last: the graph code above must be defined first
