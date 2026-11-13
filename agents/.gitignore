@@ -10,3 +10,8 @@ lights.json
 *.ipynb
 .venv/
 __pycache__/
+memory/
+
+# kept out of the public repo (local only)
+kg/
+TODO.md
